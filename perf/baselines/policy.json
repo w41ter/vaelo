@@ -1,0 +1,8 @@
+{
+  "minimum_repeats": 3,
+  "admissible_suites": ["standard", "stress"],
+  "maximum_throughput_cv_percent": 5.0,
+  "throughput_regression_percent": -5.0,
+  "p99_regression_percent": 10.0,
+  "cpu_regression_percent": 10.0
+}

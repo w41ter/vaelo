@@ -1,0 +1,15 @@
+[package]
+name = "vaelo-codegen-tests"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+vaelo = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[build-dependencies]
+vaelo-build = { workspace = true }

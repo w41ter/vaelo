@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package perf;
+
+message EchoRequest {
+  bytes payload = 1;
+}
+
+message EchoResponse {
+  bytes payload = 1;
+}
+
+service EchoService {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+  rpc Expand(EchoRequest) returns (stream EchoResponse);
+  rpc Collect(stream EchoRequest) returns (EchoResponse);
+  rpc Chat(stream EchoRequest) returns (stream EchoResponse);
+}

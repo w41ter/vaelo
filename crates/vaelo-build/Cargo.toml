@@ -1,0 +1,10 @@
+[package]
+name = "vaelo-build"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Protobuf service code generation for Vaelo"
+publish = false
+
+[dependencies]
+prost-build = { workspace = true }

@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/vaelo",
+    "crates/vaelo-build",
+    "crates/vaelo-derive",
+    "examples/multi-protocol",
+    "examples/api-design",
+    "perf/runner",
+    "tests/codegen",
+    "tests/interop",
+    "tools/xtask",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+base64 = "0.22"
+bytes = "1.10"
+http = "1.3"
+prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
+pin-project-lite = "0.2"
+percent-encoding = "2.3"
+serde_json = "1"
+tokio = { version = "1.47" }
+tokio-stream = { version = "0.1" }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+vaelo = { path = "crates/vaelo" }
+vaelo-build = { path = "crates/vaelo-build" }
+vaelo-derive = { path = "crates/vaelo-derive" }

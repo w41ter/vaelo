@@ -1,0 +1,11 @@
+[
+  {"id":"latency-empty","scenario":"ping-pong","request_size":0,"response_size":0,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"single","grpc":"single","http2":"single","tonic":"single"}},
+  {"id":"latency-small","scenario":"ping-pong","request_size":64,"response_size":64,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"single","grpc":"single","http2":"single","tonic":"single"}},
+  {"id":"throughput-small","scenario":"window","request_size":64,"response_size":64,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"tagged","grpc":"single","http2":"single","tonic":"single"}},
+  {"id":"throughput-1k","scenario":"window","request_size":1024,"response_size":1024,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"tagged","grpc":"single","http2":"single","tonic":"single"}},
+  {"id":"throughput-16k","scenario":"window","request_size":16384,"response_size":16384,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"single","grpc":"single","http2":"single","tonic":"single"}},
+  {"id":"throughput-64k","scenario":"window","request_size":65536,"response_size":65536,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"single","grpc":"single","http2":"single","tonic":"single"}},
+  {"id":"throughput-1m","scenario":"window","request_size":1048576,"response_size":1048576,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"single","grpc":"single","http2":"single","tonic":"single"}},
+  {"id":"upload-heavy","scenario":"window","request_size":65536,"response_size":64,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"single","grpc":"single","http2":"single","tonic":"single"}},
+  {"id":"download-heavy","scenario":"window","request_size":64,"response_size":65536,"protocols":["brpc","grpc","http2","tonic"],"connections":{"brpc":"single","grpc":"single","http2":"single","tonic":"single"}}
+]

@@ -1,0 +1,12 @@
+[package]
+name = "vaelo-derive"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Derive macros for Vaelo"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]

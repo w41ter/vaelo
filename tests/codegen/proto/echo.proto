@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+package fixture;
+
+import "google/protobuf/field_mask.proto";
+
+// RPC-only generation must not require Serde on well-known message types.
+message FieldMaskEnvelope {
+  google.protobuf.FieldMask field_mask = 1;
+}
+
+message EchoRequest {
+  string message = 1;
+}
+message EchoResponse {
+  string message = 1;
+}
+service EchoService {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+}

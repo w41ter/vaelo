@@ -1,0 +1,35 @@
+[package]
+name = "vaelo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "High-performance asynchronous RPC framework with bRPC, gRPC, and HTTP support"
+readme = "../../README.md"
+publish = false
+
+[dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+crossbeam-epoch = "0.9"
+crossbeam-queue = "0.3"
+hashbrown = { version = "0.15", features = ["raw-entry"] }
+http = { workspace = true }
+httparse = "1.10"
+log = "0.4"
+prost = { workspace = true }
+pin-project-lite = { workspace = true }
+percent-encoding = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+socket2 = "0.6"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { workspace = true }
+vaelo-derive = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "resource_pool"
+harness = false

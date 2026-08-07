@@ -1,0 +1,17 @@
+[package]
+name = "vaelo-api-design"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { workspace = true }
+vaelo = { workspace = true }
+
+[build-dependencies]
+vaelo-build = { workspace = true }

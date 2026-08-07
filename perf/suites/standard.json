@@ -1,0 +1,1 @@
+{"name":"standard","cases":["latency-small","throughput-small","throughput-1k","throughput-16k","throughput-64k","upload-heavy","download-heavy"],"repeat":3,"iters":10000,"warmup":1000,"threads":2,"server_threads":2,"window":16,"timeout_ms":5000}
