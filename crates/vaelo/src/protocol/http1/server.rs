@@ -31,7 +31,6 @@ pub(super) fn new_session(
             next_request: AtomicU64::new(0),
             response_owner: AtomicBool::new(false),
             completed: Mutex::new(OrderedResponses::default()),
-            _lifecycle: context.lifecycle,
         })
         .map_err(|_| Error::ResourceExhausted)
 }
@@ -48,7 +47,6 @@ pub(crate) struct ServerSession {
     next_request: AtomicU64,
     response_owner: AtomicBool,
     completed: Mutex<OrderedResponses>,
-    _lifecycle: Option<crate::server::ServerConnectionGuard>,
 }
 
 #[derive(Default)]

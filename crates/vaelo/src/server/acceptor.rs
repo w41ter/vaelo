@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpSocket, TcpStream, ToSocketAddrs};
 use tokio_util::sync::CancellationToken;
 
-use super::builder::ConnectionLifecycle;
 use super::{IntoServiceRegistry, ServiceRegistry};
 use crate::protocol::{ProbeSelection, ProtocolSet, probe_allowed};
 use crate::transport::tcp::TcpConnection;
@@ -76,7 +75,6 @@ pub struct RpcAcceptor {
     http_registry: super::HttpRegistry,
     builtin_registry: super::HttpRegistry,
     http_options: super::HttpServerOptions,
-    lifecycle: Option<Arc<ConnectionLifecycle>>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,7 +107,6 @@ impl RpcAcceptor {
             http_registry: super::HttpRegistry::default(),
             builtin_registry: super::HttpRegistry::default(),
             http_options: super::HttpServerOptions::default(),
-            lifecycle: None,
         }
     }
 
@@ -132,19 +129,12 @@ impl RpcAcceptor {
         self.builtin_registry = services.into_http_registry(self.services.clone());
         self
     }
-
-    pub(super) fn with_lifecycle(mut self, lifecycle: Arc<ConnectionLifecycle>) -> Self {
-        self.lifecycle = Some(lifecycle);
-        self
-    }
 }
 
 impl Acceptor for RpcAcceptor {
     fn accept(&self, socket: AcceptedTcpSocket) -> Result<()> {
         let remote_addr = socket.remote_addr;
         let connection = TcpConnection::accept(socket.stream, remote_addr)?;
-        let lifecycle =
-            self.lifecycle.as_ref().map(|lifecycle| lifecycle.register(connection.clone()));
         spawn_protocol_detection(
             connection,
             remote_addr,
@@ -153,7 +143,6 @@ impl Acceptor for RpcAcceptor {
             self.http_registry.clone(),
             self.builtin_registry.clone(),
             self.http_options.clone(),
-            lifecycle,
         );
         Ok(())
     }
@@ -168,7 +157,6 @@ fn spawn_protocol_detection(
     http_registry: super::HttpRegistry,
     builtin_registry: super::HttpRegistry,
     http_options: super::HttpServerOptions,
-    lifecycle: Option<super::ServerConnectionGuard>,
 ) {
     tokio::spawn(async move {
         detect_protocol(
@@ -179,7 +167,6 @@ fn spawn_protocol_detection(
             http_registry,
             builtin_registry,
             http_options,
-            lifecycle,
         )
         .await;
     });
@@ -194,7 +181,6 @@ async fn detect_protocol(
     http_registry: super::HttpRegistry,
     builtin_registry: super::HttpRegistry,
     http_options: super::HttpServerOptions,
-    lifecycle: Option<super::ServerConnectionGuard>,
 ) {
     let mut input = IoBuf::new();
     loop {
@@ -219,7 +205,6 @@ async fn detect_protocol(
                         http_registry,
                         builtin_registry,
                         http_options,
-                        lifecycle,
                     },
                     input,
                 );

@@ -2,14 +2,11 @@
 
 //! High-level server construction API.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use tokio::net::{TcpListener, ToSocketAddrs};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -17,8 +14,7 @@ use super::{
     HttpServerOptions, RegisterService, RpcAcceptor, RpcAcceptorOptions, ServiceRegistryBuilder,
 };
 use crate::protocol::ProtocolSet;
-use crate::transport::tcp::TcpConnection;
-use crate::{ObservationPolicy, Protocol, Resource, RpcProtocol, http};
+use crate::{ObservationPolicy, Protocol, RpcProtocol, http};
 
 /// TCP listener configuration applied while binding.
 ///
@@ -54,25 +50,6 @@ impl Default for TcpOptions {
     }
 }
 
-/// Policy used after a shutdown signal stops new admission.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ShutdownPolicy {
-    /// Maximum graceful drain duration. None waits without a framework-imposed
-    /// deadline; deployments should normally configure a finite value.
-    drain_timeout: Option<Duration>,
-}
-
-impl ShutdownPolicy {
-    pub const fn graceful() -> Self {
-        Self { drain_timeout: None }
-    }
-
-    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.drain_timeout = Some(timeout);
-        self
-    }
-}
-
 /// Application-facing server builder.
 ///
 /// `RpcAcceptor`, registries and listener handles remain available as low-level
@@ -86,7 +63,6 @@ pub struct ServerBuilder {
     http_options: HttpServerOptions,
     tcp_options: TcpOptions,
     builtins: Option<BuiltinServices>,
-    shutdown_policy: ShutdownPolicy,
     observation: ObservationPolicy,
 }
 
@@ -100,7 +76,6 @@ impl Default for ServerBuilder {
             http_options: HttpServerOptions::default(),
             tcp_options: TcpOptions::default(),
             builtins: None,
-            shutdown_policy: ShutdownPolicy::default(),
             observation: ObservationPolicy::Disabled,
         }
     }
@@ -145,11 +120,6 @@ impl ServerBuilder {
     /// never silently reserves application routes.
     pub fn builtins(mut self, services: BuiltinServices) -> Self {
         self.builtins = Some(services);
-        self
-    }
-
-    pub fn shutdown_policy(mut self, policy: ShutdownPolicy) -> Self {
-        self.shutdown_policy = policy;
         self
     }
 
@@ -225,13 +195,11 @@ impl ServerBuilder {
         }
 
         let services = self.services.build();
-        let lifecycle = Arc::new(ConnectionLifecycle::default());
         let mut acceptor = RpcAcceptor::with_options(
             services,
             RpcAcceptorOptions { allowed_protocols: allowed, ..RpcAcceptorOptions::default() },
         )
-        .with_http(self.http_routes.build(), self.http_options)
-        .with_lifecycle(lifecycle.clone());
+        .with_http(self.http_routes.build(), self.http_options);
         if let Some(builtins) = self.builtins {
             acceptor = acceptor.with_builtin(builtins);
         }
@@ -248,9 +216,7 @@ impl ServerBuilder {
             local_addrs: Box::new([local_addr]),
             acceptor: Arc::new(acceptor),
             nodelay: self.tcp_options.nodelay,
-            lifecycle,
             shutdown: CancellationToken::new(),
-            shutdown_policy: self.shutdown_policy,
         })
     }
 
@@ -259,8 +225,7 @@ impl ServerBuilder {
         self.bind(address).await?.serve().await
     }
 
-    /// Serves until `shutdown` resolves, then stops admission and drains active
-    /// work according to the server's graceful-shutdown policy.
+    /// Serves until `shutdown` resolves, then stops admitting new connections.
     pub async fn serve_with_shutdown<S>(
         self,
         address: impl ToSocketAddrs,
@@ -283,9 +248,7 @@ pub struct BoundServer {
     local_addrs: Box<[SocketAddr]>,
     acceptor: Arc<RpcAcceptor>,
     nodelay: bool,
-    lifecycle: Arc<ConnectionLifecycle>,
     shutdown: CancellationToken,
-    shutdown_policy: ShutdownPolicy,
 }
 
 impl BoundServer {
@@ -306,9 +269,8 @@ impl BoundServer {
         self.serve_until(shutdown.cancelled()).await
     }
 
-    /// Stops admission when shutdown resolves, then drains according to the
-    /// configured ShutdownPolicy. Completion means the policy has finished,
-    /// not merely that a cancellation flag was set.
+    /// Stops admission when shutdown resolves. Existing protocol tasks retain
+    /// ownership of their connections and finish independently.
     pub async fn serve_with_shutdown<S>(self, shutdown: S) -> std::io::Result<()>
     where
         S: Future<Output = ()> + Send,
@@ -321,7 +283,7 @@ impl BoundServer {
         S: Future<Output = ()>,
     {
         tokio::pin!(shutdown_signal);
-        let admission = loop {
+        loop {
             let accepted = tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => break Ok(()),
@@ -349,18 +311,7 @@ impl BoundServer {
             {
                 break Err(std::io::Error::other(error.to_string()));
             }
-        };
-
-        let drained = self.lifecycle.wait_empty();
-        if let Some(timeout) = self.shutdown_policy.drain_timeout {
-            if tokio::time::timeout(timeout, drained).await.is_err() {
-                self.lifecycle.close_all();
-                self.lifecycle.wait_empty().await;
-            }
-        } else {
-            drained.await;
         }
-        admission
     }
 }
 
@@ -396,59 +347,6 @@ fn to_public_request(request: HttpRequest) -> http::Request<http::Incoming> {
     request
 }
 
-#[derive(Default)]
-pub(super) struct ConnectionLifecycle {
-    active: Mutex<HashMap<u64, Resource<TcpConnection>>>,
-    changed: Notify,
-}
-
-impl ConnectionLifecycle {
-    pub(super) fn register(
-        self: &Arc<Self>,
-        connection: Resource<TcpConnection>,
-    ) -> ServerConnectionGuard {
-        let id = connection.id().as_u64();
-        self.active.lock().unwrap().insert(id, connection);
-        ServerConnectionGuard {
-            _registration: Arc::new(ConnectionRegistration { id, lifecycle: self.clone() }),
-        }
-    }
-
-    fn close_all(&self) {
-        let connections: Vec<_> = self.active.lock().unwrap().values().cloned().collect();
-        for connection in connections {
-            connection.close();
-        }
-    }
-
-    async fn wait_empty(&self) {
-        loop {
-            let changed = self.changed.notified();
-            if self.active.lock().unwrap().is_empty() {
-                return;
-            }
-            changed.await;
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ServerConnectionGuard {
-    _registration: Arc<ConnectionRegistration>,
-}
-
-struct ConnectionRegistration {
-    id: u64,
-    lifecycle: Arc<ConnectionLifecycle>,
-}
-
-impl Drop for ConnectionRegistration {
-    fn drop(&mut self) {
-        self.lifecycle.active.lock().unwrap().remove(&self.id);
-        self.lifecycle.changed.notify_waiters();
-    }
-}
-
 /// Cloneable control-plane handle for a bound or running server.
 ///
 /// Signalling is synchronous and cheap; callers observe completion by awaiting
@@ -471,6 +369,7 @@ impl ServerHandle {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use bytes::BufMut;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -567,8 +466,6 @@ mod tests {
         let server = ServerBuilder::new()
             .rpc_protocols([])
             .http_versions([http::Version::Http2])
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(20)))
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(20)))
             .route(http::Method::GET, "/h2/:name", |request| async move {
                 assert_eq!(request.version(), ::http::Version::HTTP_2);
                 let name = http::ServerRequestExt::path_param(&request, "name").unwrap();
@@ -612,7 +509,6 @@ mod tests {
         let server = ServerBuilder::new()
             .rpc_protocols([])
             .http_versions([http::Version::Http2])
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(20)))
             .route(http::Method::POST, "/detached", move |_request| {
                 let observed = observed.clone();
                 async move {
@@ -654,7 +550,6 @@ mod tests {
         let server = ServerBuilder::new()
             .rpc_protocols([])
             .http_versions([http::Version::Http2])
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(20)))
             .route(http::Method::GET, "/retry", |_request| async move {
                 Ok(http::Response::new(http::Full::new(http_data(b"ok"))))
             })
@@ -679,7 +574,6 @@ mod tests {
         let server = ServerBuilder::new()
             .rpc_protocols([])
             .http_versions([http::Version::Http2])
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(20)))
             .route(http::Method::GET, "/slow", |_request| async move {
                 std::future::pending::<Result<http::Response<http::Empty>, http::Error>>().await
             })
@@ -711,7 +605,6 @@ mod tests {
             .rpc_protocols([])
             .http_versions([http::Version::Http2])
             .http_options(HttpServerOptions::default().max_header_size(128).max_body_size(4))
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(20)))
             .route(http::Method::POST, "/limited", |request| async move {
                 let _ = request.into_body().collect().await;
                 Ok(http::Response::new(http::Empty::new()))
@@ -748,7 +641,6 @@ mod tests {
         let server = ServerBuilder::new()
             .rpc_protocols([])
             .http_versions([http::Version::Http2])
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(20)))
             .route(http::Method::POST, "/stream", |request| async move {
                 let request_body = request.into_body().collect().await.unwrap();
                 assert!(request_body.chunks().flatten().copied().eq(b"request".iter().copied()));
@@ -808,7 +700,6 @@ mod tests {
         let server = ServerBuilder::new()
             .rpc_protocols([])
             .http_versions([http::Version::Http2])
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(20)))
             .route(http::Method::POST, "/early", |_request| async move {
                 Ok(http::Response::new(http::Full::new(http_data(b"accepted"))))
             })
@@ -853,34 +744,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_timeout_closes_active_connections() {
+    async fn shutdown_does_not_wait_for_active_connections() {
         let server = ServerBuilder::new()
             .rpc_protocols([])
             .http_versions([http::Version::Http1])
-            .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(10)))
             .bind("127.0.0.1:0")
             .await
             .unwrap();
         let address = server.local_addr();
         let handle = server.handle();
-        let lifecycle = server.lifecycle.clone();
         let serving = tokio::spawn(server.serve());
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(b"G").await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while lifecycle.active.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
         handle.shutdown();
-        tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap().unwrap();
-
-        let mut byte = [0_u8; 1];
-        let closed =
-            tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await.unwrap();
-        assert!(matches!(closed, Ok(0) | Err(_)));
+        tokio::time::timeout(std::time::Duration::from_secs(2), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

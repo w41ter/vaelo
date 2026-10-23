@@ -14,12 +14,7 @@ pub(super) fn new_session(
     context: ServerSessionContext,
 ) -> Result<Resource<ServerSession>> {
     ServerSession::resource_pool()
-        .acquire_with_init(|| ServerSession {
-            connection,
-            protocol,
-            services: context.services,
-            _lifecycle: context.lifecycle,
-        })
+        .acquire_with_init(|| ServerSession { connection, protocol, services: context.services })
         .map_err(|_| Error::ResourceExhausted)
 }
 
@@ -37,7 +32,6 @@ pub(crate) struct ServerSession {
     connection: Resource<TcpConnection>,
     protocol: &'static BrpcProtocol,
     services: crate::ServiceRegistry,
-    _lifecycle: Option<crate::server::ServerConnectionGuard>,
 }
 
 impl ServerSession {

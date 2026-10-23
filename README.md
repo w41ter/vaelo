@@ -40,8 +40,8 @@ adopting the gRPC ecosystem, or expose RPC and HTTP interfaces through one servi
 | Observability | Logging, runtime metrics, performance sampling, and built-in health/status endpoints |
 
 Vaelo does not yet promise support for TLS, continuous service-discovery refresh, general-purpose
-load balancing, or automatic retries. The server supports bounded graceful shutdown, but
-applications remain responsible for making their own long-lived business tasks cancellation-aware.
+load balancing, or automatic retries. Server shutdown stops new connection admission; applications
+remain responsible for draining or cancelling their own long-lived business tasks.
 
 ## Performance
 

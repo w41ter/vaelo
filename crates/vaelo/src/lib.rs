@@ -53,7 +53,7 @@ pub use metadata::{InvalidMetadataKey, MetadataEntry, MetadataKey, MetadataMap, 
 pub(crate) use protocol::{Decode, Encode};
 pub use server::{
     BoundServer, BuiltinExposure, BuiltinServices, BuiltinServicesBuilder, HealthCheck,
-    HttpRpcMapping, HttpServerOptions, ServerBuilder, ServerHandle, ShutdownPolicy, TcpOptions,
+    HttpRpcMapping, HttpServerOptions, ServerBuilder, ServerHandle, TcpOptions,
 };
 pub(crate) use server::{ServerController, ServerResponse, ServiceRegistry};
 pub(crate) use transport::{TcpTransport, Transport};

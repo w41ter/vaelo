@@ -12,8 +12,7 @@ mod service;
 pub use acceptor::{
     AcceptedTcpSocket, Acceptor, ListenerHandle, RpcAcceptor, RpcAcceptorOptions, Server,
 };
-pub(crate) use builder::ServerConnectionGuard;
-pub use builder::{BoundServer, ServerBuilder, ServerHandle, ShutdownPolicy, TcpOptions};
+pub use builder::{BoundServer, ServerBuilder, ServerHandle, TcpOptions};
 pub use builtin::{BuiltinExposure, BuiltinServices, BuiltinServicesBuilder, HealthCheck};
 pub use http::{
     HttpRegistry, HttpRegistryBuilder, HttpRequest, HttpResponse, HttpRpcMapping, HttpServerOptions,
@@ -32,5 +31,4 @@ pub(crate) struct ServerSessionContext {
     pub http_registry: HttpRegistry,
     pub builtin_registry: HttpRegistry,
     pub http_options: HttpServerOptions,
-    pub lifecycle: Option<builder::ServerConnectionGuard>,
 }

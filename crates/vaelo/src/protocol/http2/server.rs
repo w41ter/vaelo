@@ -71,11 +71,7 @@ impl ServerSession {
             }
         };
         while let Some(accepted) = connection.accept_stream().await {
-            // The lifecycle guard represents the physical connection, not an
-            // individual handler. Keeping it in a stalled handler would make
-            // forced server shutdown wait forever after the socket is closed.
-            let mut context = self.context.clone();
-            context.lifecycle = None;
+            let context = self.context.clone();
             if is_grpc(&accepted.headers) {
                 tokio::spawn(async move {
                     let AcceptedStream { stream, headers, end_stream } = accepted;

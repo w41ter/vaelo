@@ -21,7 +21,7 @@ use vaelo::__private::{
 };
 use vaelo::{
     ConnectionMode, IoBufBuilder, Request, Response, RpcChannel as VaeloChannel, ServerBuilder,
-    ShutdownPolicy, Status, http,
+    Status, http,
 };
 
 static ECHO_METHOD: MethodDescriptor =
@@ -827,7 +827,6 @@ fn run_local_server(
             let server = match ServerBuilder::new()
                 .rpc_protocols([])
                 .http_versions([http::Version::Http2])
-                .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(50)))
                 .route(http::Method::POST, "/echo", move |request| async move {
                     use vaelo::http::BodyExt;
 
@@ -920,7 +919,6 @@ fn run_foreground_server(config: &Config) -> Result<(), Box<dyn Error>> {
             let server = ServerBuilder::new()
                 .rpc_protocols([])
                 .http_versions([http::Version::Http2])
-                .shutdown_policy(ShutdownPolicy::graceful().with_timeout(Duration::from_millis(50)))
                 .route(http::Method::POST, "/echo", move |request| async move {
                     use vaelo::http::BodyExt;
 
