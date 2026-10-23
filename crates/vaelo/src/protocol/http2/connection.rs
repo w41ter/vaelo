@@ -43,7 +43,6 @@ const SEND_ENDPOINT_DROPPED: u8 = 1 << 0;
 const RECV_ENDPOINT_DROPPED: u8 = 1 << 1;
 
 const OUTBOUND_ITEMS: usize = 32;
-const INBOUND_ITEMS: usize = 32;
 const INBOUND_HEADER_ITEMS: usize = 4;
 const PENDING_COMMANDS: usize = 1024;
 const INLINE_COMMANDS: usize = 8;
@@ -109,7 +108,6 @@ pub(crate) struct H2Connection {
     yield_requested: AtomicBool,
     write_waiting: AtomicBool,
     read_ready: AtomicBool,
-    inbound_blocked: AtomicBool,
     driver_notify: Notify,
     commands: ArrayQueue<ConnectionCommand>,
     accepted_streams: ArrayQueue<AcceptedStream>,
@@ -147,7 +145,6 @@ struct H2Core {
     hpack_encoder: HpackEncoder,
     hpack_decoder: HpackDecoder,
     continuation: Option<HeaderContinuation>,
-    blocked_inbound: Option<(Resource<H2StreamShared>, ReceivedEvent)>,
     peer_goaway_last_stream_id: Option<StreamId>,
     connection_send_window: i64,
     connection_recv_window: i64,
@@ -170,6 +167,7 @@ struct HeaderContinuation {
     stream_id: StreamId,
     block: IoBuf,
     end_stream: bool,
+    discard: bool,
 }
 
 struct StreamOwnerState {
@@ -181,6 +179,7 @@ struct StreamOwnerState {
     flow_blocked: bool,
     driver: Option<H2StreamDriver>,
     received_body_bytes: usize,
+    body_size_limit: Option<usize>,
 }
 
 struct PendingData {
@@ -320,7 +319,6 @@ struct H2StreamShared {
     outbound: OnceLock<Box<ArrayQueue<OutboundItem>>>,
     inbound_slots: Mutex<InboundSlots>,
     inbound_headers: OnceLock<Box<ArrayQueue<ReceivedHeader>>>,
-    inbound_data_queue: OnceLock<Box<ArrayQueue<ReceivedData>>>,
     complete_send: Mutex<Option<H2DirectSend>>,
     recv_failure: Mutex<Option<RecvStreamError>>,
     cancellation: Mutex<Option<CancellationToken>>,
@@ -367,7 +365,8 @@ pub(crate) struct H2StreamCancel {
 
 pub(crate) struct H2RecvStream {
     shared: Resource<H2StreamShared>,
-    connection: Resource<H2Connection>,
+    // Keeps the parent connection alive for the lifetime of the receive half.
+    _connection: Resource<H2Connection>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -636,7 +635,6 @@ impl H2Connection {
                 yield_requested: AtomicBool::new(false),
                 write_waiting: AtomicBool::new(false),
                 read_ready: AtomicBool::new(input_ready),
-                inbound_blocked: AtomicBool::new(false),
                 driver_notify: Notify::new(),
                 commands: ArrayQueue::new(PENDING_COMMANDS),
                 accepted_streams: ArrayQueue::new(PENDING_COMMANDS),
@@ -664,7 +662,6 @@ impl H2Connection {
                     hpack_encoder: HpackEncoder::new(HpackConfig::default()),
                     hpack_decoder: HpackDecoder::new(hpack_config),
                     continuation: None,
-                    blocked_inbound: None,
                     peer_goaway_last_stream_id: None,
                     connection_send_window: INITIAL_WINDOW_SIZE,
                     connection_recv_window: LOCAL_CONNECTION_RECV_WINDOW as i64,
@@ -883,18 +880,7 @@ impl H2Connection {
         }
         self.notified.store(false, Ordering::Release);
 
-        if let Some((stream, event)) = core.blocked_inbound.take() {
-            match stream.push_inbound(event) {
-                Ok(()) => {
-                    self.inbound_blocked.store(false, Ordering::Release);
-                    stream.wake_receiver();
-                }
-                Err(event) => core.blocked_inbound = Some((stream, event)),
-            }
-        }
-
-        if core.blocked_inbound.is_none()
-            && self.read_ready.swap(false, Ordering::AcqRel)
+        if self.read_ready.swap(false, Ordering::AcqRel)
             && let Err(error) = self.read_available(core)
         {
             if error == RecvStreamError::ProtocolError {
@@ -1067,11 +1053,11 @@ impl H2Connection {
                 return Err(error);
             }
             frames += 1;
-            if core.blocked_inbound.is_some() {
-                break;
-            }
         }
-        if frames == READ_FRAMES {
+        // Reaching either cooperative budget means the socket may still be
+        // readable. We did not drive it to WouldBlock, so explicitly retain
+        // read work instead of relying on another readiness edge.
+        if total >= READ_BYTES || frames == READ_FRAMES {
             self.read_ready.store(true, Ordering::Release);
             self.mark_work();
         }
@@ -1179,7 +1165,7 @@ impl H2Connection {
                     .received_body_bytes
                     .checked_add(bytes)
                     .ok_or(RecvStreamError::ResourceExhausted)?;
-                if core.max_body_size.is_some_and(|limit| owner.received_body_bytes > limit) {
+                if owner.body_size_limit.is_some_and(|limit| owner.received_body_bytes > limit) {
                     let credit =
                         FlowCredit { connection: stream.connection, stream: stream.id(), bytes };
                     drop(credit);
@@ -1304,7 +1290,11 @@ impl H2Connection {
         let Some(stream) = core.streams.get(&frame.header.stream_id) else {
             return Err(RecvStreamError::ProtocolError);
         };
-        if stream.state.load(Ordering::Acquire) & (STREAM_REMOTE_CLOSED | STREAM_FAILED) != 0 {
+        let state = stream.state.load(Ordering::Acquire);
+        if state & STREAM_FAILED != 0 {
+            return Self::discard_closed_headers(core, frame);
+        }
+        if state & STREAM_REMOTE_CLOSED != 0 {
             return Err(RecvStreamError::ProtocolError);
         }
 
@@ -1334,15 +1324,16 @@ impl H2Connection {
         if block.len() > core.hpack_decoder.max_header_block_size() {
             return Err(RecvStreamError::ProtocolError);
         }
-        core.continuation =
-            Some(HeaderContinuation { stream_id: frame.header.stream_id, block, end_stream });
+        core.continuation = Some(HeaderContinuation {
+            stream_id: frame.header.stream_id,
+            block,
+            end_stream,
+            discard: false,
+        });
         Ok(())
     }
 
     fn discard_closed_headers(core: &mut H2Core, mut frame: Frame) -> Result<(), RecvStreamError> {
-        if !frame.header.flags.contains(FrameFlags::END_HEADERS) {
-            return Err(RecvStreamError::ProtocolError);
-        }
         let padding = if frame.header.flags.contains(FrameFlags::PADDED) {
             if !frame.payload.has_remaining() {
                 return Err(RecvStreamError::ProtocolError);
@@ -1361,7 +1352,19 @@ impl H2Connection {
             return Err(RecvStreamError::ProtocolError);
         }
         let block = frame.payload.split_to(frame.payload.remaining() - padding);
-        core.hpack_decoder.decode(block).map_err(|_| RecvStreamError::ProtocolError)?;
+        if frame.header.flags.contains(FrameFlags::END_HEADERS) {
+            core.hpack_decoder.decode(block).map_err(|_| RecvStreamError::ProtocolError)?;
+        } else {
+            if block.len() > core.hpack_decoder.max_header_block_size() {
+                return Err(RecvStreamError::ProtocolError);
+            }
+            core.continuation = Some(HeaderContinuation {
+                stream_id: frame.header.stream_id,
+                block,
+                end_stream: frame.header.flags.contains(FrameFlags::END_STREAM),
+                discard: true,
+            });
+        }
         Ok(())
     }
 
@@ -1378,12 +1381,19 @@ impl H2Connection {
             return Err(RecvStreamError::ProtocolError);
         }
         if frame.header.flags.contains(FrameFlags::END_HEADERS) {
-            self.deliver_headers(
-                core,
-                continuation.stream_id,
-                continuation.block,
-                continuation.end_stream,
-            )
+            if continuation.discard {
+                core.hpack_decoder
+                    .decode(continuation.block)
+                    .map(|_| ())
+                    .map_err(|_| RecvStreamError::ProtocolError)
+            } else {
+                self.deliver_headers(
+                    core,
+                    continuation.stream_id,
+                    continuation.block,
+                    continuation.end_stream,
+                )
+            }
         } else {
             core.continuation = Some(continuation);
             Ok(())
@@ -1445,6 +1455,18 @@ impl H2Connection {
                     {
                         return Err(RecvStreamError::ProtocolError);
                     }
+                    // HTTP body limits are cumulative, while gRPC streaming
+                    // can legitimately carry an unbounded sequence of
+                    // individually bounded messages on one HTTP/2 stream.
+                    // The gRPC framing decoder enforces its per-message limit.
+                    let grpc = headers.fields().any(|field| {
+                        field.name.as_ref() == b"content-type"
+                            && field.value.as_ref().starts_with(b"application/grpc")
+                    });
+                    // SAFETY: inbound header delivery runs under the
+                    // connection owner and is the only owner-state accessor.
+                    unsafe { &mut *stream.owner.get() }.body_size_limit =
+                        if grpc { None } else { core.max_body_size };
                     stream.headers_received.store(true, Ordering::Release);
                 }
             }
@@ -1508,30 +1530,19 @@ impl H2Connection {
         }
         match stream.push_inbound(event) {
             Ok(()) => stream.wake_receiver(),
-            Err(event) => {
-                debug_assert!(core.blocked_inbound.is_none());
-                core.blocked_inbound = Some((stream.clone(), event));
-                self.inbound_blocked.store(true, Ordering::Release);
-                self.read_ready.store(true, Ordering::Release);
-
-                // Closing the backpressure gate must account for a receiver
-                // that freed a slot just before `inbound_blocked` became
-                // visible. Such a receiver observed the old false value and
-                // therefore had no reason to notify the connection. Retry the
-                // parked event after publishing the gate; if space was freed
-                // in that window, consume it now. Otherwise a later receiver
-                // pop observes true and schedules another drive.
-                let (blocked_stream, blocked_event) =
-                    core.blocked_inbound.take().expect("blocked inbound event was just parked");
-                match blocked_stream.push_inbound(blocked_event) {
-                    Ok(()) => {
-                        self.inbound_blocked.store(false, Ordering::Release);
-                        blocked_stream.wake_receiver();
-                    }
-                    Err(blocked_event) => {
-                        core.blocked_inbound = Some((blocked_stream, blocked_event));
-                    }
+            Err(_event) => {
+                // Per-stream buffering must never stop reads for the whole
+                // HTTP/2 connection. DATA is coalesced under flow-control
+                // bounds; excess informational headers fail only this stream.
+                let state = stream.state.load(Ordering::Acquire);
+                if state & STREAM_WIRE_OPEN != 0
+                    && state & (STREAM_LOCAL_CLOSED | STREAM_REMOTE_CLOSED)
+                        != STREAM_LOCAL_CLOSED | STREAM_REMOTE_CLOSED
+                {
+                    core.control_frames
+                        .push_back(Self::reset_frame(stream.id, ErrorCode::EnhanceYourCalm));
                 }
+                stream.fail_receiver(RecvStreamError::ResourceExhausted);
             }
         }
         Ok(())
@@ -1794,7 +1805,6 @@ impl H2Connection {
             outbound: OnceLock::new(),
             inbound_slots: Mutex::new(InboundSlots::default()),
             inbound_headers: OnceLock::new(),
-            inbound_data_queue: OnceLock::new(),
             complete_send: Mutex::new(None),
             recv_failure: Mutex::new(None),
             cancellation: Mutex::new(None),
@@ -1810,16 +1820,13 @@ impl H2Connection {
                 flow_blocked: false,
                 driver,
                 received_body_bytes: 0,
+                body_size_limit: None,
             }),
         }
     }
 
     fn drain_abandoned_streams(core: &mut H2Core, connection: &Self) {
         while let Some(stream_id) = connection.abandoned_streams.pop() {
-            if core.blocked_inbound.as_ref().is_some_and(|(stream, _)| stream.id == stream_id) {
-                core.blocked_inbound = None;
-                connection.inbound_blocked.store(false, Ordering::Release);
-            }
             let Some(stream) = core.streams.remove(&stream_id) else { continue };
             let state = stream.state.load(Ordering::Acquire);
             if state & (STREAM_FAILED | STREAM_WIRE_OPEN) == STREAM_WIRE_OPEN
@@ -2279,8 +2286,7 @@ impl H2Connection {
 
     fn has_immediate_work(&self) -> bool {
         self.notified.load(Ordering::Acquire)
-            || (self.read_ready.load(Ordering::Acquire)
-                && !self.inbound_blocked.load(Ordering::Acquire))
+            || self.read_ready.load(Ordering::Acquire)
             || !self.commands.is_empty()
             || !self.abandoned_streams.is_empty()
             || !self.ready_streams.is_empty()
@@ -2289,8 +2295,7 @@ impl H2Connection {
 
     fn has_runnable_work(&self) -> bool {
         let write_waiting = self.write_waiting.load(Ordering::Acquire);
-        let read_work = self.read_ready.load(Ordering::Acquire)
-            && !self.inbound_blocked.load(Ordering::Acquire);
+        let read_work = self.read_ready.load(Ordering::Acquire);
         self.has_immediate_work() && (!write_waiting || read_work)
     }
 
@@ -2332,11 +2337,10 @@ impl H2Connection {
                 continue;
             }
 
-            let wait_read = !connection.inbound_blocked.load(Ordering::Acquire);
             let wait_write = connection.write_waiting.load(Ordering::Acquire);
             tokio::select! {
                 _ = connection.driver_notify.notified() => {}
-                result = connection.socket.transport().readable(), if wait_read => {
+                result = connection.socket.transport().readable() => {
                     match result {
                         Ok(()) => connection.read_ready.store(true, Ordering::Release),
                         Err(error) => {
@@ -2388,7 +2392,6 @@ impl H2Connection {
         core.write_segments.clear();
         core.input = IoBuf::new();
         core.continuation = None;
-        core.blocked_inbound = None;
         while let Some(open) = core.pending_opens.pop_front() {
             open.fail(OpenStreamError::ConnectionClosed);
         }
@@ -2416,7 +2419,7 @@ impl H2Stream {
         let send =
             H2SendStream { shared: self.shared.clone(), connection: self.connection.clone() };
         let recv =
-            H2RecvStream { shared: self.shared.clone(), connection: self.connection.clone() };
+            H2RecvStream { shared: self.shared.clone(), _connection: self.connection.clone() };
         (send, recv)
     }
 }
@@ -2509,20 +2512,24 @@ impl H2StreamShared {
                 })
             }
             ReceivedEvent::Data(data) => {
-                if let Some(queue) = self.inbound_data_queue.get() {
-                    return queue.push(data).map_err(ReceivedEvent::Data);
-                }
-                if slots.data.is_none() {
+                if let Some(buffered) = slots.data.as_mut() {
+                    let ReceivedData { mut payload, end_stream, mut _credit } = data;
+                    debug_assert_eq!(buffered._credit.connection, _credit.connection);
+                    debug_assert_eq!(buffered._credit.stream, _credit.stream);
+                    buffered.payload.append_movable(&mut payload);
+                    buffered.end_stream |= end_stream;
+                    buffered._credit.bytes = buffered
+                        ._credit
+                        .bytes
+                        .checked_add(_credit.bytes)
+                        .expect("inbound flow credit overflow");
+                    // Transfer ownership of the credit to the coalesced DATA
+                    // event instead of returning it while bytes are buffered.
+                    _credit.bytes = 0;
+                } else {
                     slots.data = Some(data);
-                    return Ok(());
                 }
-                // The initial header previously occupied one entry in the
-                // combined queue. Preserve the same backpressure bound while
-                // keeping the common single DATA item inline.
-                let queue = self
-                    .inbound_data_queue
-                    .get_or_init(|| Box::new(ArrayQueue::new(INBOUND_ITEMS - 2)));
-                queue.push(data).map_err(ReceivedEvent::Data)
+                Ok(())
             }
         }
     }
@@ -2546,11 +2553,6 @@ impl H2StreamShared {
             });
         }
         if let Some(data) = slots.data.take() {
-            return Some(ReceivedEvent::Data(data));
-        }
-        if let Some(queue) = self.inbound_data_queue.get()
-            && let Some(data) = queue.pop()
-        {
             return Some(ReceivedEvent::Data(data));
         }
         slots.trailers.take().map(|header| ReceivedEvent::Headers {
@@ -2610,9 +2612,6 @@ impl H2StreamShared {
         slots.trailers = None;
         if let Some(headers) = self.inbound_headers.get() {
             while headers.pop().is_some() {}
-        }
-        if let Some(inbound) = self.inbound_data_queue.get() {
-            while inbound.pop().is_some() {}
         }
         drop(slots);
         self.wake_receiver();
@@ -2981,15 +2980,6 @@ impl H2RecvStream {
             cancellation.cancel();
         }
     }
-
-    fn notify_inbound_space(&self) {
-        let connection = &self.connection;
-        if !connection.inbound_blocked.load(Ordering::Acquire) {
-            return;
-        }
-        connection.mark_work();
-        H2Connection::try_drive(connection.clone(), DriveQuota::INLINE);
-    }
 }
 
 impl Future for RecvEventFuture<'_> {
@@ -2998,7 +2988,6 @@ impl Future for RecvEventFuture<'_> {
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let shared = &self.stream.shared;
         if let Some(event) = shared.pop_inbound() {
-            self.stream.notify_inbound_space();
             return Poll::Ready(Ok(Some(event)));
         }
         let state = shared.state.load(Ordering::Acquire);
@@ -3019,7 +3008,6 @@ impl Future for RecvEventFuture<'_> {
         *shared.recv_waker.lock().unwrap() = Some(context.waker().clone());
         if let Some(event) = shared.pop_inbound() {
             shared.recv_waker.lock().unwrap().take();
-            self.stream.notify_inbound_space();
             return Poll::Ready(Ok(Some(event)));
         }
         let state = shared.state.load(Ordering::Acquire);
@@ -3033,10 +3021,7 @@ impl Future for RecvEventFuture<'_> {
         } else if state & STREAM_REMOTE_CLOSED != 0 {
             shared.recv_waker.lock().unwrap().take();
             match shared.pop_inbound() {
-                Some(event) => {
-                    self.stream.notify_inbound_space();
-                    Poll::Ready(Ok(Some(event)))
-                }
+                Some(event) => Poll::Ready(Ok(Some(event))),
                 None => Poll::Ready(Ok(None)),
             }
         } else {

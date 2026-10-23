@@ -144,8 +144,12 @@ fn request_headers() -> HeaderBlock {
 }
 
 fn response_headers_frame(stream_id: u32, end_stream: bool) -> Frame {
+    response_status_headers_frame(stream_id, 200, end_stream)
+}
+
+fn response_status_headers_frame(stream_id: u32, status: u16, end_stream: bool) -> Frame {
     let mut headers = HeaderBlock::new();
-    headers.pseudo.status = Some(200);
+    headers.pseudo.status = Some(status);
     let payload = HpackEncoder::new(HpackConfig::default()).encode(&headers).unwrap();
     Frame {
         header: FrameHeader {
@@ -154,6 +158,31 @@ fn response_headers_frame(stream_id: u32, end_stream: bool) -> Frame {
             flags: FrameFlags::new(
                 FrameFlags::END_HEADERS | if end_stream { FrameFlags::END_STREAM } else { 0 },
             ),
+            stream_id: StreamId::new(stream_id).unwrap(),
+        },
+        payload,
+    }
+}
+
+fn request_headers_frame(
+    encoder: &mut HpackEncoder,
+    stream_id: u32,
+    content_type: Option<&'static [u8]>,
+) -> Frame {
+    let mut headers = request_headers();
+    if let Some(content_type) = content_type {
+        headers.push(super::super::hpack::HeaderField {
+            name: Bytes::from_static(b"content-type"),
+            value: Bytes::from_static(content_type),
+            indexing: super::super::hpack::HeaderIndexing::WithoutIndexing,
+        });
+    }
+    let payload = encoder.encode(&headers).unwrap();
+    Frame {
+        header: FrameHeader {
+            length: payload.len() as u32,
+            kind: FrameKind::Headers,
+            flags: FrameFlags::new(FrameFlags::END_HEADERS),
             stream_id: StreamId::new(stream_id).unwrap(),
         },
         payload,
@@ -229,7 +258,6 @@ fn window_update_core(role: ConnectionRole) -> H2Core {
         hpack_encoder: HpackEncoder::new(HpackConfig::default()),
         hpack_decoder: HpackDecoder::new(HpackConfig::default()),
         continuation: None,
-        blocked_inbound: None,
         peer_goaway_last_stream_id: None,
         connection_send_window: INITIAL_WINDOW_SIZE,
         connection_recv_window: INITIAL_WINDOW_SIZE,
@@ -543,11 +571,13 @@ async fn data_outliving_a_reaped_stream_still_restores_connection_credit() {
 
     assert!(matches!(recv.recv().await.unwrap(), Some(ReceivedEvent::Headers { .. })));
     let mut received = Vec::new();
-    for _ in 0..CONNECTION_WINDOW_UPDATE_THRESHOLD
-        .div_ceil(super::super::frame::DEFAULT_MAX_FRAME_SIZE as usize)
-    {
+    let mut received_bytes = 0;
+    while received_bytes < CONNECTION_WINDOW_UPDATE_THRESHOLD {
         match recv.recv().await.unwrap().unwrap() {
-            ReceivedEvent::Data(data) => received.push(data),
+            ReceivedEvent::Data(data) => {
+                received_bytes += data.payload.len();
+                received.push(data);
+            }
             ReceivedEvent::Headers { .. } => panic!("expected DATA"),
         }
     }
@@ -951,10 +981,12 @@ async fn dropping_received_data_batches_connection_and_stream_window_updates() {
     peer.write_all(&wire).await.unwrap();
 
     assert!(matches!(recv.recv().await.unwrap().unwrap(), ReceivedEvent::Headers { .. }));
-    for _ in 0..CONNECTION_WINDOW_UPDATE_THRESHOLD
-        .div_ceil(super::super::frame::DEFAULT_MAX_FRAME_SIZE as usize)
-    {
-        drop(recv.recv().await.unwrap().unwrap());
+    let mut received_bytes = 0;
+    while received_bytes < CONNECTION_WINDOW_UPDATE_THRESHOLD {
+        let event = recv.recv().await.unwrap().unwrap();
+        let ReceivedEvent::Data(data) = event else { panic!("expected DATA") };
+        received_bytes += data.payload.len();
+        drop(data);
     }
 
     let ack = read_wire_frame(&mut peer).await;
@@ -1028,7 +1060,8 @@ async fn read_continuation_delivers_data_and_remote_end_to_one_stream() {
 }
 
 #[tokio::test]
-async fn full_inbound_queue_pauses_and_resumes_without_closing_connection() {
+async fn inbound_data_beyond_old_queue_capacity_is_coalesced() {
+    const DATA_FRAMES: usize = 40;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let client = TcpStream::connect(address).await.unwrap();
@@ -1044,12 +1077,12 @@ async fn full_inbound_queue_pauses_and_resumes_without_closing_connection() {
     let headers = frame::encode(response_headers_frame(1, false)).unwrap();
     let mut wire = flatten(&settings);
     wire.extend_from_slice(&flatten(&headers));
-    for index in 0..(INBOUND_ITEMS + 8) {
+    for index in 0..DATA_FRAMES {
         let data = frame::encode(Frame {
             header: FrameHeader {
                 length: 1,
                 kind: FrameKind::Data,
-                flags: FrameFlags::new(if index + 1 == INBOUND_ITEMS + 8 {
+                flags: FrameFlags::new(if index + 1 == DATA_FRAMES {
                     FrameFlags::END_STREAM
                 } else {
                     0
@@ -1067,21 +1100,112 @@ async fn full_inbound_queue_pauses_and_resumes_without_closing_connection() {
         let mut values = Vec::new();
         while let Some(event) = recv.recv().await.unwrap() {
             if let ReceivedEvent::Data(data) = event {
-                values.push(flatten(&data.payload)[0]);
+                values.extend(flatten(&data.payload));
             }
         }
         values
     })
     .await
     .unwrap();
-    assert_eq!(received.len(), INBOUND_ITEMS + 8);
-    assert_eq!(received, (0..(INBOUND_ITEMS + 8)).map(|value| value as u8).collect::<Vec<_>>());
+    assert_eq!(received, (0..DATA_FRAMES).map(|value| value as u8).collect::<Vec<_>>());
     assert_eq!(connection.state.load(Ordering::Acquire), CONNECTION_OPEN);
     connection.close();
 }
 
 #[tokio::test]
-async fn canceling_stream_blocking_inbound_resumes_connection_reads() {
+async fn slow_stream_does_not_block_other_streams_on_the_connection() {
+    const DATA_FRAMES: usize = 40;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = TcpStream::connect(address).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let socket = TcpSocket::resource_pool()
+        .acquire_with_init(|| TcpSocket::new(TcpTransport::new(client)))
+        .unwrap();
+    let connection = H2Connection::new(super::ConnectionRole::Client, socket);
+    let first = connection.open_stream().await.unwrap();
+    let second = connection.open_stream().await.unwrap();
+    let (_first_send, _first_recv) = first.split();
+    let (_second_send, mut second_recv) = second.split();
+
+    let settings = frame::encode(Settings::default().frame(false)).unwrap();
+    let first_headers = frame::encode(response_headers_frame(1, false)).unwrap();
+    let mut wire = flatten(&settings);
+    wire.extend_from_slice(&flatten(&first_headers));
+    for index in 0..DATA_FRAMES {
+        let data = frame::encode(Frame {
+            header: FrameHeader {
+                length: 1,
+                kind: FrameKind::Data,
+                flags: FrameFlags::default(),
+                stream_id: StreamId::new(1).unwrap(),
+            },
+            payload: payload(&[index as u8]),
+        })
+        .unwrap();
+        wire.extend_from_slice(&flatten(&data));
+    }
+    wire.extend_from_slice(&flatten(&frame::encode(response_headers_frame(3, true)).unwrap()));
+    peer.write_all(&wire).await.unwrap();
+
+    let event = tokio::time::timeout(Duration::from_millis(250), second_recv.recv())
+        .await
+        .expect("a slow stream must not head-of-line block its HTTP/2 connection")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, ReceivedEvent::Headers { end_stream: true, .. }));
+    connection.close();
+}
+
+#[tokio::test]
+async fn excess_headers_fail_only_the_offending_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = TcpStream::connect(address).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let socket = TcpSocket::resource_pool()
+        .acquire_with_init(|| TcpSocket::new(TcpTransport::new(client)))
+        .unwrap();
+    let connection = H2Connection::new(super::ConnectionRole::Client, socket);
+    let first = connection.open_stream().await.unwrap();
+    let second = connection.open_stream().await.unwrap();
+    let (_first_send, mut first_recv) = first.split();
+    let (_second_send, mut second_recv) = second.split();
+
+    let mut wire = flatten(&frame::encode(Settings::default().frame(false)).unwrap());
+    for _ in 0..(INBOUND_HEADER_ITEMS + 2) {
+        wire.extend_from_slice(&flatten(
+            &frame::encode(response_status_headers_frame(1, 103, false)).unwrap(),
+        ));
+    }
+    wire.extend_from_slice(&flatten(&frame::encode(response_headers_frame(3, true)).unwrap()));
+    peer.write_all(&wire).await.unwrap();
+
+    let first_result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match first_recv.recv().await {
+                Err(error) => break error,
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("header-flooded stream ended without an error"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(first_result, RecvStreamError::ResourceExhausted);
+    let second_event = tokio::time::timeout(Duration::from_secs(2), second_recv.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(second_event, ReceivedEvent::Headers { end_stream: true, .. }));
+    assert_eq!(connection.state.load(Ordering::Acquire), CONNECTION_OPEN);
+    connection.close();
+}
+
+#[tokio::test]
+async fn canceling_a_slow_stream_does_not_interrupt_connection_reads() {
+    const DATA_FRAMES: usize = 40;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let client = TcpStream::connect(address).await.unwrap();
@@ -1098,7 +1222,7 @@ async fn canceling_stream_blocking_inbound_resumes_connection_reads() {
     let headers = frame::encode(response_headers_frame(1, false)).unwrap();
     let mut wire = flatten(&settings);
     wire.extend_from_slice(&flatten(&headers));
-    for index in 0..INBOUND_ITEMS {
+    for index in 0..DATA_FRAMES {
         let data = frame::encode(Frame {
             header: FrameHeader {
                 length: 1,
@@ -1113,13 +1237,6 @@ async fn canceling_stream_blocking_inbound_resumes_connection_reads() {
     }
     peer.write_all(&wire).await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !connection.inbound_blocked.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
     send.cancel_handle().cancel();
 
     let second = connection.open_stream().await.unwrap();
@@ -1135,7 +1252,6 @@ async fn canceling_stream_blocking_inbound_resumes_connection_reads() {
         .unwrap()
         .unwrap();
     assert!(matches!(event, ReceivedEvent::Headers { end_stream: true, .. }));
-    assert!(!connection.inbound_blocked.load(Ordering::Acquire));
     assert_eq!(connection.state.load(Ordering::Acquire), CONNECTION_OPEN);
     connection.close();
 }
@@ -1311,5 +1427,176 @@ async fn reset_only_fails_its_target_stream() {
     let ReceivedEvent::Data(second_result) = second_result else { panic!("expected DATA") };
     assert_eq!(flatten(&second_result.payload), b"ok");
     assert_eq!(connection.state.load(Ordering::Acquire), CONNECTION_OPEN);
+    connection.close();
+}
+
+#[tokio::test]
+async fn late_headers_for_failed_stream_do_not_fail_the_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = TcpStream::connect(address).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let socket = TcpSocket::resource_pool()
+        .acquire_with_init(|| TcpSocket::new(TcpTransport::new(client)))
+        .unwrap();
+    let connection = H2Connection::new(super::ConnectionRole::Client, socket);
+    let first = connection.open_stream().await.unwrap();
+    let second = connection.open_stream().await.unwrap();
+    let (_first_send, mut first_recv) = first.split();
+    let (_second_send, mut second_recv) = second.split();
+
+    let settings = frame::encode(Settings::default().frame(false)).unwrap();
+    let reset = frame::encode(reset_frame(1)).unwrap();
+    let late_headers = frame::encode(response_headers_frame(1, true)).unwrap();
+    let second_headers = frame::encode(response_headers_frame(3, true)).unwrap();
+    let mut wire = flatten(&settings);
+    wire.extend_from_slice(&flatten(&reset));
+    wire.extend_from_slice(&flatten(&late_headers));
+    wire.extend_from_slice(&flatten(&second_headers));
+    peer.write_all(&wire).await.unwrap();
+
+    let first_result =
+        tokio::time::timeout(Duration::from_secs(2), first_recv.recv()).await.unwrap();
+    assert!(matches!(first_result, Err(RecvStreamError::Reset(8))));
+    let second_result =
+        tokio::time::timeout(Duration::from_secs(2), second_recv.recv()).await.unwrap().unwrap();
+    assert!(matches!(second_result, Some(ReceivedEvent::Headers { end_stream: true, .. })));
+    assert_eq!(connection.state.load(Ordering::Acquire), CONNECTION_OPEN);
+    connection.close();
+}
+
+#[tokio::test]
+async fn fragmented_late_headers_for_failed_stream_keep_hpack_synchronized() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = TcpStream::connect(address).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let socket = TcpSocket::resource_pool()
+        .acquire_with_init(|| TcpSocket::new(TcpTransport::new(client)))
+        .unwrap();
+    let connection = H2Connection::new(super::ConnectionRole::Client, socket);
+    let first = connection.open_stream().await.unwrap();
+    let second = connection.open_stream().await.unwrap();
+    let (_first_send, mut first_recv) = first.split();
+    let (_second_send, mut second_recv) = second.split();
+
+    let mut headers = HeaderBlock::new();
+    headers.pseudo.status = Some(200);
+    let mut block = HpackEncoder::new(HpackConfig::default()).encode(&headers).unwrap();
+    let first_byte = block.split_to(1);
+    let late_headers = frame::encode(Frame {
+        header: FrameHeader {
+            length: first_byte.len() as u32,
+            kind: FrameKind::Headers,
+            flags: FrameFlags::new(FrameFlags::END_STREAM),
+            stream_id: StreamId::new(1).unwrap(),
+        },
+        payload: first_byte,
+    })
+    .unwrap();
+    let continuation = frame::encode(Frame {
+        header: FrameHeader {
+            length: block.len() as u32,
+            kind: FrameKind::Continuation,
+            flags: FrameFlags::new(FrameFlags::END_HEADERS),
+            stream_id: StreamId::new(1).unwrap(),
+        },
+        payload: block,
+    })
+    .unwrap();
+    let settings = frame::encode(Settings::default().frame(false)).unwrap();
+    let reset = frame::encode(reset_frame(1)).unwrap();
+    let second_headers = frame::encode(response_headers_frame(3, true)).unwrap();
+    let mut wire = flatten(&settings);
+    wire.extend_from_slice(&flatten(&reset));
+    wire.extend_from_slice(&flatten(&late_headers));
+    wire.extend_from_slice(&flatten(&continuation));
+    wire.extend_from_slice(&flatten(&second_headers));
+    peer.write_all(&wire).await.unwrap();
+
+    let first_result =
+        tokio::time::timeout(Duration::from_secs(2), first_recv.recv()).await.unwrap();
+    assert!(matches!(first_result, Err(RecvStreamError::Reset(8))));
+    let second_result =
+        tokio::time::timeout(Duration::from_secs(2), second_recv.recv()).await.unwrap().unwrap();
+    assert!(matches!(second_result, Some(ReceivedEvent::Headers { end_stream: true, .. })));
+    assert_eq!(connection.state.load(Ordering::Acquire), CONNECTION_OPEN);
+    connection.close();
+}
+
+#[tokio::test]
+async fn grpc_streams_use_per_message_instead_of_cumulative_http_body_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = TcpStream::connect(address).await.unwrap();
+    let (_peer, _) = listener.accept().await.unwrap();
+    let socket = TcpSocket::resource_pool()
+        .acquire_with_init(|| TcpSocket::new(TcpTransport::new(client)))
+        .unwrap();
+    let connection = H2Connection::new(ConnectionRole::Client, socket);
+    while connection
+        .owner
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        tokio::task::yield_now().await;
+    }
+    // SAFETY: the test owns the connection baton.
+    let core = unsafe { &mut *connection.core.get() };
+    core.role = ConnectionRole::Server;
+    core.max_body_size = Some(4);
+    core.peer_settings_received = true;
+    let mut encoder = HpackEncoder::new(HpackConfig::default());
+
+    connection
+        .handle_inbound_frame(
+            core,
+            request_headers_frame(&mut encoder, 1, Some(b"application/grpc+proto")),
+        )
+        .unwrap();
+    for _ in 0..2 {
+        connection
+            .handle_inbound_frame(
+                core,
+                Frame {
+                    header: FrameHeader {
+                        length: 4,
+                        kind: FrameKind::Data,
+                        flags: FrameFlags::default(),
+                        stream_id: StreamId::new(1).unwrap(),
+                    },
+                    payload: payload(b"data"),
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        core.streams[&StreamId::new(1).unwrap()].state.load(Ordering::Acquire) & STREAM_FAILED,
+        0
+    );
+
+    connection.handle_inbound_frame(core, request_headers_frame(&mut encoder, 3, None)).unwrap();
+    connection
+        .handle_inbound_frame(
+            core,
+            Frame {
+                header: FrameHeader {
+                    length: 5,
+                    kind: FrameKind::Data,
+                    flags: FrameFlags::default(),
+                    stream_id: StreamId::new(3).unwrap(),
+                },
+                payload: payload(b"large"),
+            },
+        )
+        .unwrap();
+    assert_ne!(
+        core.streams[&StreamId::new(3).unwrap()].state.load(Ordering::Acquire) & STREAM_FAILED,
+        0
+    );
+
+    core.streams.clear();
+    while connection.accepted_streams.pop().is_some() {}
+    connection.owner.store(false, Ordering::Release);
     connection.close();
 }

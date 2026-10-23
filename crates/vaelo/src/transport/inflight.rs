@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::client::recycler::ClientActivityGuard;
 use crate::foundation::intrusive_forward_list::IntrusiveForwardListLink;
+use crate::runtime::rpc_variables::RpcCallGuard;
 use crate::{IoBuf, MetadataMap, Resource, ResourceId, StaticResource, Status, StatusCode};
 
 const ACTIVE: u8 = 1;
@@ -48,6 +49,7 @@ struct CallContextInner {
     waiter: Option<Waker>,
     completion_notifier: Option<CompletionNotifier>,
     connection_activity: Option<ClientActivityGuard>,
+    detached_variables: Option<RpcCallGuard>,
 }
 
 #[derive(Clone, Copy)]
@@ -77,6 +79,7 @@ impl CallContext {
                 waiter: None,
                 completion_notifier: None,
                 connection_activity,
+                detached_variables: None,
             }),
         }
     }
@@ -167,7 +170,8 @@ impl CallContext {
             log::debug!("call completion ignored: call already completed");
             return false;
         }
-        let (waker, notifier, connection_activity) = {
+        let status_code = status.as_ref().map(Status::code);
+        let (waker, notifier, connection_activity, detached_variables) = {
             let mut inner = self.inner.lock().expect("call context mutex poisoned");
             inner.completion = Some(CallOutput {
                 payload,
@@ -183,9 +187,13 @@ impl CallContext {
                 inner.waiter.take(),
                 inner.completion_notifier.take(),
                 inner.connection_activity.take(),
+                inner.detached_variables.take(),
             )
         };
         drop(connection_activity);
+        if let Some(variables) = detached_variables {
+            variables.finish(status_code);
+        }
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -193,6 +201,22 @@ impl CallContext {
             (notifier.notify)(notifier.token);
         }
         true
+    }
+
+    fn detach_variables(&self, variables: RpcCallGuard) {
+        let status_code = {
+            let mut inner = self.inner.lock().expect("call context mutex poisoned");
+            if self.state.load(Ordering::Acquire) != COMPLETED {
+                debug_assert!(inner.detached_variables.is_none());
+                inner.detached_variables = Some(variables);
+                return;
+            }
+            inner
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.status.as_ref().map(Status::code))
+        };
+        variables.finish(status_code);
     }
 
     pub(crate) fn complete_deadline_exceeded(&self) -> bool {
@@ -250,6 +274,10 @@ impl CallToken {
             IoBuf::new(),
             Some(Status::new(StatusCode::Canceled, "call canceled")),
         )
+    }
+
+    pub(crate) fn detach(self, variables: RpcCallGuard) {
+        self.context.detach_variables(variables);
     }
 }
 

@@ -188,7 +188,28 @@ where
     /// The submitted RPC continues independently under ownership of the RPC
     /// runtime. Detaching does not change the call's progress model and must
     /// not require the caller to keep polling a future.
-    pub fn detach(self) {
+    pub fn detach(mut self) {
+        match std::mem::replace(&mut self.state, RpcCallState::Finished) {
+            RpcCallState::Active(token) => {
+                // The protocol owns its own CallContext reference and drives
+                // the unary exchange to completion. Transfer the metrics guard
+                // to that context instead of spawning a response-waiting task.
+                if let Some(variables) = self.variables.take() {
+                    token.detach(variables);
+                }
+                return;
+            }
+            RpcCallState::Ready(status) => {
+                let status = status.expect("detached ready RPC must retain its status");
+                if let Some(variables) = self.variables.take() {
+                    variables.finish(Some(status.code()));
+                }
+                log::warn!("detached RPC failed before submission: {status}");
+                return;
+            }
+            state @ RpcCallState::StreamingUnary { .. } => self.state = state,
+            RpcCallState::Finished => return,
+        }
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(async move {

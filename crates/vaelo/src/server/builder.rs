@@ -374,9 +374,77 @@ mod tests {
     use bytes::BufMut;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio_stream::StreamExt;
 
     use super::*;
-    use crate::IoBufBuilder;
+    use crate::descriptor::Idempotency;
+    use crate::server::{
+        ClientStreamingProstMethod, RegisterService, ServerStreamingProstMethod,
+        ServiceRegistryBuilder,
+    };
+    use crate::{IoBufBuilder, MethodDescriptor, MethodKind, Request, Response, Status};
+
+    static LARGE_GRPC_STREAM: MethodDescriptor = MethodDescriptor::new(
+        "test.Streaming",
+        "Large",
+        MethodKind::ServerStreaming,
+        Idempotency::NoSideEffects,
+    );
+
+    static LARGE_GRPC_UPLOAD: MethodDescriptor = MethodDescriptor::new(
+        "test.Streaming",
+        "Upload",
+        MethodKind::ClientStreaming,
+        Idempotency::NoSideEffects,
+    );
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct EmptyMessage {}
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct BlobMessage {
+        #[prost(bytes = "vec", tag = "1")]
+        data: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct CountMessage {
+        #[prost(uint64, tag = "1")]
+        bytes: u64,
+    }
+
+    struct LargeStreamingService;
+
+    impl RegisterService for LargeStreamingService {
+        fn register(self, registry: &mut ServiceRegistryBuilder) {
+            registry.register(
+                &LARGE_GRPC_STREAM,
+                ServerStreamingProstMethod::new(
+                    Arc::new(()),
+                    |_service: Arc<()>, _request: Request<EmptyMessage>| async move {
+                        let messages = (0..128).map(|index| {
+                            Ok(BlobMessage { data: vec![(index % 251) as u8; 32 * 1024] })
+                        });
+                        Ok(Response::new(tokio_stream::iter(messages)))
+                    },
+                ),
+            );
+            registry.register(
+                &LARGE_GRPC_UPLOAD,
+                ClientStreamingProstMethod::new(
+                    Arc::new(()),
+                    |_service: Arc<()>, request: Request<crate::Streaming<BlobMessage, Status>>| async move {
+                        let mut stream = request.into_inner();
+                        let mut bytes = 0;
+                        while let Some(message) = stream.next().await {
+                            bytes += message?.data.len() as u64;
+                        }
+                        Ok(Response::new(CountMessage { bytes }))
+                    },
+                ),
+            );
+        }
+    }
 
     #[tokio::test]
     async fn high_level_server_routes_http_and_stops_from_handle() {
@@ -688,6 +756,117 @@ mod tests {
             trailers.unwrap().get("x-finished").unwrap(),
             ::http::HeaderValue::from_static("yes")
         );
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn http2_streaming_response_crosses_flow_control_windows() {
+        use crate::http::BodyExt;
+
+        const CHUNKS: usize = 128;
+        const CHUNK_SIZE: usize = 32 * 1024;
+        let server = ServerBuilder::new()
+            .rpc_protocols([])
+            .http_versions([http::Version::Http2])
+            .route(http::Method::GET, "/large-stream", |_request| async move {
+                let frames = (0..CHUNKS).map(|index| {
+                    let data = vec![(index % 251) as u8; CHUNK_SIZE];
+                    Ok::<_, http::Error>(http::Frame::Data(http_data(&data)))
+                });
+                Ok(http::Response::new(http::Stream::new(tokio_stream::iter(frames))))
+            })
+            .bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr();
+        let handle = server.handle();
+        let serving = tokio::spawn(server.serve());
+        let client = http::Client::http2(address).build().unwrap();
+        let request = ::http::Request::get("/large-stream").body(http::Empty::new()).unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), client.request(request))
+            .await
+            .unwrap()
+            .unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body.len(), CHUNKS * CHUNK_SIZE);
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn grpc_server_streaming_crosses_flow_control_windows() {
+        let server = ServerBuilder::new()
+            .rpc_protocols([RpcProtocol::Grpc])
+            .http_versions([])
+            .add_service(LargeStreamingService)
+            .bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr();
+        let handle = server.handle();
+        let serving = tokio::spawn(server.serve());
+        let channel = crate::RpcChannel::grpc(address).build().unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            channel.server_streaming::<_, BlobMessage>(
+                &LARGE_GRPC_STREAM,
+                Request::new(EmptyMessage {}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut stream = response.into_inner();
+        let mut bytes = 0;
+        while let Some(message) =
+            tokio::time::timeout(Duration::from_secs(5), stream.next()).await.unwrap()
+        {
+            bytes += message.unwrap().data.len();
+        }
+        assert_eq!(bytes, 128 * 32 * 1024);
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn grpc_client_streaming_crosses_flow_control_windows() {
+        const MESSAGES: usize = 128;
+        const MESSAGE_SIZE: usize = 32 * 1024;
+        let server = ServerBuilder::new()
+            .rpc_protocols([RpcProtocol::Grpc])
+            .http_versions([])
+            .add_service(LargeStreamingService)
+            .bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr();
+        let handle = server.handle();
+        let serving = tokio::spawn(server.serve());
+        let channel = crate::RpcChannel::grpc(address).build().unwrap();
+        let mut call =
+            channel.client_streaming::<BlobMessage, CountMessage>(&LARGE_GRPC_UPLOAD).start();
+
+        for index in 0..MESSAGES {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                call.send(BlobMessage { data: vec![(index % 251) as u8; MESSAGE_SIZE] }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("client-streaming send {index} timed out"))
+            .unwrap();
+        }
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), call.finish()).await.unwrap().unwrap();
+        assert_eq!(response.into_inner().bytes, (MESSAGES * MESSAGE_SIZE) as u64);
 
         handle.shutdown();
         tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap().unwrap();
