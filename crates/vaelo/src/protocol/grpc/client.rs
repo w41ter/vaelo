@@ -1541,6 +1541,7 @@ mod tests {
     fn recycler_preserves_active_connection_then_replaces_it_when_idle() {
         let key = ConnectionKey {
             remote: "127.0.0.1:61235".parse().unwrap(),
+            endpoint_id: 0,
             tag: 0,
             slot: 0,
             connect_timeout: None,
@@ -1570,6 +1571,7 @@ mod tests {
     fn short_connections_do_not_allocate_recycler_state() {
         let key = ConnectionKey {
             remote: "127.0.0.1:61236".parse().unwrap(),
+            endpoint_id: 0,
             tag: 0,
             slot: 0,
             connect_timeout: None,

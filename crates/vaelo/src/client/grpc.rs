@@ -21,6 +21,7 @@ where
     if channel.wire_protocol() != crate::Protocol::Grpc {
         return Err(Status::new(StatusCode::InvalidArgument, "channel protocol is not gRPC"));
     }
+    let endpoint = channel.pick_endpoint()?;
     let profile_sampled = profile::sample_next();
     let (message, mut options, attachment) = request.into_wire_parts();
     if options.request_id.is_some() || options.log_id.is_some() || !attachment.is_empty() {
@@ -32,7 +33,7 @@ where
     let payload = encode_request(&message, profile_sampled)?;
     options.profile_sampled = profile_sampled;
     let config = crate::protocol::grpc::GrpcConfig::default();
-    let key = channel.connection_key_with_tag(connection_tag);
+    let key = channel.connection_key_with_tag(endpoint, connection_tag);
     let short_connection = channel.options().connection_mode == ConnectionMode::Short;
     let alloc_start = profile::start_if(profile_sampled);
     let context = CallContext::resource_pool()
@@ -57,6 +58,7 @@ pub(crate) fn start_streaming_owned(
     if channel.wire_protocol() != crate::Protocol::Grpc {
         return Err(Status::new(StatusCode::InvalidArgument, "streaming RPC requires gRPC"));
     }
+    let endpoint = channel.pick_endpoint()?;
     let profile_sampled = profile::sample_next();
     let (_, mut options, attachment) = request.into_wire_parts();
     if options.request_id.is_some() || options.log_id.is_some() || !attachment.is_empty() {
@@ -69,7 +71,7 @@ pub(crate) fn start_streaming_owned(
     let context = CallContext::resource_pool()
         .acquire_with_init(|| CallContext::new(options.deadline, profile_sampled))
         .map_err(|_| Status::new(StatusCode::ResourceExhausted, "call resources exhausted"))?;
-    let key = channel.connection_key_with_tag(connection_tag);
+    let key = channel.connection_key_with_tag(endpoint, connection_tag);
     let short_connection = channel.options().connection_mode == ConnectionMode::Short;
     let streams = submit_streaming(
         key,

@@ -37,11 +37,13 @@ adopting the gRPC ecosystem, or expose RPC and HTTP interfaces through one servi
 | HTTP/2 | Server and gRPC paths; a general-purpose HTTP/2 client is not yet implemented |
 | Multiple protocols on one port | bRPC, HTTP/1.1, HTTP/2, and gRPC over HTTP/2 |
 | Connection strategies | Reuse, pooling, short connections, connection groups, connect timeout, one-shot endpoint resolution, and explicit cache eviction |
+| Service discovery | Direct `SocketAddr`, built-in `dns://` and `list://` targets, pluggable naming schemes, TTL-bounded stale snapshots, and fail-fast unresolved calls |
+| Load balancing | Lock-free round-robin selection across discovered endpoints |
 | Observability | Logging, runtime metrics, performance sampling, and built-in health/status endpoints |
 
-Vaelo does not yet promise support for TLS, continuous service-discovery refresh, general-purpose
-load balancing, or automatic retries. Server shutdown stops new connection admission; applications
-remain responsible for draining or cancelling their own long-lived business tasks.
+Vaelo does not yet promise support for TLS, load-balancing policies beyond round robin, or automatic
+retries. Server shutdown stops new connection admission; applications remain responsible for
+draining or cancelling their own long-lived business tasks.
 
 ## Performance
 

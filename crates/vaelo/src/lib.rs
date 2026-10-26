@@ -38,9 +38,10 @@ pub use buffer::{IoBuf, IoBufBuilder, IoBufChunks, IoBufMut};
 pub use client::RawStreaming;
 pub use client::{
     BidiStreaming, BidiStreamingCall, CallHandle, CallStats, ClientStreaming, ClientStreamingCall,
-    ConnectionMode, ConnectionTag, IntoRequest, ObservationPolicy, Request, RequestContext,
-    Response, RpcChannel, RpcChannelBuilder, SendStream, ServerStreamingCall, Streaming,
-    StreamingCallHandle, UnaryCall,
+    ConnectionMode, ConnectionTag, Endpoint, EndpointId, EndpointSnapshot, IntoRequest,
+    NamingError, NamingService, NamingWatch, ObservationPolicy, Request, RequestContext, Response,
+    RpcChannel, RpcChannelBuilder, RpcTarget, SendStream, ServerStreamingCall, ServiceName,
+    Streaming, StreamingCallHandle, UnaryCall, register_naming_service,
 };
 pub(crate) use descriptor::{MethodDescriptor, MethodKind, Protocol};
 pub use descriptor::{RequestProtocol, RpcProtocol};

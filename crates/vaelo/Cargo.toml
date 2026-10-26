@@ -24,7 +24,7 @@ serde_json = { workspace = true }
 socket2 = "0.6"
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["time"] }
 vaelo-derive = { workspace = true }
 
 [dev-dependencies]

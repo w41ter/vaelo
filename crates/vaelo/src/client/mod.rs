@@ -7,6 +7,7 @@ pub(crate) mod call;
 pub(crate) mod channel;
 pub(crate) mod grpc;
 pub(crate) mod http;
+mod naming;
 pub(crate) mod recycler;
 mod request;
 mod response;
@@ -15,7 +16,11 @@ mod streaming;
 pub use call::{CallHandle, UnaryCall};
 pub(crate) use channel::{Channel, ChannelOptions};
 pub use channel::{
-    ConnectionMode, ConnectionTag, ObservationPolicy, RpcChannel, RpcChannelBuilder,
+    ConnectionMode, ConnectionTag, ObservationPolicy, RpcChannel, RpcChannelBuilder, RpcTarget,
+};
+pub use naming::{
+    Endpoint, EndpointId, EndpointSnapshot, NamingError, NamingService, NamingWatch, ServiceName,
+    register_naming_service,
 };
 pub(crate) use request::ServerRequestInfo;
 pub use request::{IntoRequest, Request, RequestContext};

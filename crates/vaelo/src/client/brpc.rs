@@ -47,10 +47,8 @@ pub(crate) fn close_cached(key: &ConnectionKey) {
 }
 
 fn session_for(
-    channel: &Channel,
-    connection_tag: Option<ConnectionTag>,
+    key: ConnectionKey,
 ) -> crate::Result<(Resource<BrpcClientSession>, Option<super::recycler::ClientActivityGuard>)> {
-    let key = channel.connection_key_with_tag(connection_tag);
     loop {
         let session = BRPC_CONNECTIONS.get_or_create(key)?;
         if let Some(activity) = session.try_acquire_activity() {
@@ -60,8 +58,8 @@ fn session_for(
     }
 }
 
-fn issue_short_rpc(channel: &Channel, request: PreparedRequest) -> crate::Result<CallToken> {
-    BrpcClientSession::create_short(channel.remote_addr(), channel.options().connect_timeout)
+fn issue_short_rpc(key: ConnectionKey, request: PreparedRequest) -> crate::Result<CallToken> {
+    BrpcClientSession::create_short(key.remote, key.connect_timeout)
         .and_then(|session| session.issue_rpc(request, None))
 }
 
@@ -77,6 +75,8 @@ where
     if channel.wire_protocol() != crate::Protocol::Brpc {
         return Err(Status::new(StatusCode::InvalidArgument, "channel protocol is not bRPC"));
     }
+    let endpoint = channel.pick_endpoint()?;
+    let key = channel.connection_key_with_tag(endpoint, connection_tag);
     let profile_sampled = profile::sample_next();
     let (message, mut options, attachment) = request.into_wire_parts();
     let stage_start = profile::start_if(profile_sampled);
@@ -92,10 +92,9 @@ where
     let request = PreparedRequest { method, options, payload, attachment };
     match channel.options().connection_mode {
         ConnectionMode::Single | ConnectionMode::Pool { .. } => {
-            session_for(channel, connection_tag)
-                .and_then(|(session, activity)| session.issue_rpc(request, activity))
+            session_for(key).and_then(|(session, activity)| session.issue_rpc(request, activity))
         }
-        ConnectionMode::Short => issue_short_rpc(channel, request),
+        ConnectionMode::Short => issue_short_rpc(key, request),
     }
     .map_err(Status::from)
 }
@@ -120,15 +119,16 @@ mod tests {
 
     #[test]
     fn recycler_preserves_active_session_then_replaces_it_when_idle() {
-        let channel = crate::RpcChannel::brpc("127.0.0.1:61234".parse().unwrap()).build().unwrap();
+        let endpoint: std::net::SocketAddr = "127.0.0.1:61234".parse().unwrap();
+        let channel = crate::RpcChannel::brpc(endpoint).build().unwrap();
         let key = channel.connection_key();
-        let (session, activity) = session_for(&channel, None).unwrap();
+        let (session, activity) = session_for(key).unwrap();
         let original_id = session.id();
 
         for bucket in 0..DEFAULT_BUCKETS {
             recycle_idle_bucket(bucket, u64::MAX);
         }
-        let (same_session, second_activity) = session_for(&channel, None).unwrap();
+        let (same_session, second_activity) = session_for(key).unwrap();
         assert_eq!(same_session.id(), original_id);
 
         drop(second_activity);
@@ -136,7 +136,7 @@ mod tests {
         for bucket in 0..DEFAULT_BUCKETS {
             recycle_idle_bucket(bucket, u64::MAX);
         }
-        let (replacement, replacement_activity) = session_for(&channel, None).unwrap();
+        let (replacement, replacement_activity) = session_for(key).unwrap();
         assert_ne!(replacement.id(), original_id);
 
         drop(replacement_activity);

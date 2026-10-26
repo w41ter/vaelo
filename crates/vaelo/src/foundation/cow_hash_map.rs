@@ -320,7 +320,7 @@ mod tests {
     fn connection_key_can_be_inserted_and_read_back() {
         let remote: SocketAddr =
             "127.0.0.1:8080".parse().expect("test connection key address should parse");
-        let key = ConnectionKey { remote, tag: 42, slot: 0, connect_timeout: None };
+        let key = ConnectionKey { remote, endpoint_id: 7, tag: 42, slot: 0, connect_timeout: None };
         let same_key = key;
         let different_tag = ConnectionKey { tag: 43, ..key };
 

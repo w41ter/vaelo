@@ -2,10 +2,17 @@
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
+
+use super::naming::{
+    DynamicRoute, Endpoint, EndpointId, NamingService, ServiceName, resolve_list,
+    resolve_naming_service,
+};
 use super::{BidiStreamingCall, ClientStreamingCall, Request, ServerStreamingCall, UnaryCall};
 use crate::transport::connection::ConnectionKey;
 use crate::{Decode, Encode, Error, MethodDescriptor, Protocol, Result, RpcProtocol};
@@ -98,7 +105,7 @@ impl std::fmt::Debug for RpcChannel {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RpcChannel")
-            .field("remote", &self.inner.remote)
+            .field("remote", &self.remote_addr())
             .field("protocol", &self.protocol())
             .field("connection_mode", &self.inner.options.connection_mode)
             .field("connection_tag", &self.inner.options.connection_tag)
@@ -112,8 +119,45 @@ pub(crate) type Channel = RpcChannel;
 
 /// Builder for an [`RpcChannel`].
 pub struct RpcChannelBuilder {
-    remote: SocketAddr,
+    target: ChannelTarget,
     options: ChannelOptions,
+}
+
+enum ChannelTarget {
+    Static(SocketAddr),
+    Uri(Box<str>),
+}
+
+/// A fixed endpoint or a `scheme://address` naming target.
+pub struct RpcTarget(RpcTargetKind);
+
+enum RpcTargetKind {
+    Endpoint(SocketAddr),
+    Naming(Box<str>),
+}
+
+impl From<SocketAddr> for RpcTarget {
+    fn from(endpoint: SocketAddr) -> Self {
+        Self(RpcTargetKind::Endpoint(endpoint))
+    }
+}
+
+impl From<&str> for RpcTarget {
+    fn from(target: &str) -> Self {
+        Self(RpcTargetKind::Naming(target.into()))
+    }
+}
+
+impl From<String> for RpcTarget {
+    fn from(target: String) -> Self {
+        Self(RpcTargetKind::Naming(target.into_boxed_str()))
+    }
+}
+
+impl From<Box<str>> for RpcTarget {
+    fn from(target: Box<str>) -> Self {
+        Self(RpcTargetKind::Naming(target))
+    }
 }
 
 impl RpcChannelBuilder {
@@ -137,66 +181,68 @@ impl RpcChannelBuilder {
         self
     }
 
-    /// Builds a logical channel without performing network I/O.
+    /// Builds a logical channel.
+    ///
+    /// Fixed-address and `list://` channels perform no background work. A
+    /// refreshing naming channel starts its watch but opens no RPC connection.
     pub fn build(self) -> Result<RpcChannel> {
-        RpcChannel::with_options(self.remote, self.options)
+        match self.target {
+            ChannelTarget::Static(remote) => RpcChannel::with_options(remote, self.options),
+            ChannelTarget::Uri(target) => RpcChannel::with_uri_options(&target, self.options),
+        }
     }
 }
 
 struct ChannelInner {
-    remote: SocketAddr,
+    target: Route,
     options: ChannelOptions,
     next_connection: AtomicU64,
 }
 
+#[derive(Clone)]
+enum Route {
+    Static(Endpoint),
+    Dynamic(Arc<DynamicTarget>),
+}
+
+struct DynamicTarget {
+    service: ServiceName,
+    route: DynamicRoute,
+    cancel: CancellationToken,
+}
+
+impl Drop for DynamicTarget {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 impl RpcChannel {
-    /// Starts a bRPC channel builder. No connection is opened by this method.
-    pub fn brpc(remote: SocketAddr) -> RpcChannelBuilder {
-        Self::rpc(remote, RpcProtocol::Brpc)
+    /// Starts a bRPC channel builder for an endpoint or `scheme://address`.
+    ///
+    /// `dns://` and `list://` are built in; other schemes select a registered
+    /// naming service. No connection is opened by this method.
+    pub fn brpc(target: impl Into<RpcTarget>) -> RpcChannelBuilder {
+        Self::rpc(target, RpcProtocol::Brpc)
     }
 
-    /// Starts a gRPC channel builder. No connection is opened by this method.
-    pub fn grpc(remote: SocketAddr) -> RpcChannelBuilder {
-        Self::rpc(remote, RpcProtocol::Grpc)
+    /// Starts a gRPC channel builder for an endpoint or `scheme://address`.
+    ///
+    /// `dns://` and `list://` are built in; other schemes select a registered
+    /// naming service. No connection is opened by this method.
+    pub fn grpc(target: impl Into<RpcTarget>) -> RpcChannelBuilder {
+        Self::rpc(target, RpcProtocol::Grpc)
     }
 
-    pub fn rpc(remote: SocketAddr, protocol: RpcProtocol) -> RpcChannelBuilder {
+    pub fn rpc(target: impl Into<RpcTarget>, protocol: RpcProtocol) -> RpcChannelBuilder {
+        let target = match target.into().0 {
+            RpcTargetKind::Endpoint(endpoint) => ChannelTarget::Static(endpoint),
+            RpcTargetKind::Naming(target) => ChannelTarget::Uri(target),
+        };
         RpcChannelBuilder {
-            remote,
+            target,
             options: ChannelOptions { protocol: protocol.into(), ..ChannelOptions::default() },
         }
-    }
-
-    /// Resolves a bRPC endpoint once and returns a lazy channel builder.
-    pub async fn brpc_endpoint(
-        endpoint: impl tokio::net::ToSocketAddrs,
-    ) -> Result<RpcChannelBuilder> {
-        Self::rpc_endpoint(endpoint, RpcProtocol::Brpc).await
-    }
-
-    /// Resolves a gRPC endpoint once and returns a lazy channel builder.
-    pub async fn grpc_endpoint(
-        endpoint: impl tokio::net::ToSocketAddrs,
-    ) -> Result<RpcChannelBuilder> {
-        Self::rpc_endpoint(endpoint, RpcProtocol::Grpc).await
-    }
-
-    /// Resolves an endpoint once and selects the first returned address.
-    ///
-    /// Name refresh remains an application/service-discovery responsibility;
-    /// creating a new channel performs a new resolution. No TCP connection is
-    /// opened until the first call is submitted.
-    pub async fn rpc_endpoint(
-        endpoint: impl tokio::net::ToSocketAddrs,
-        protocol: RpcProtocol,
-    ) -> Result<RpcChannelBuilder> {
-        let mut addresses = tokio::net::lookup_host(endpoint)
-            .await
-            .map_err(|error| Error::Channel(format!("resolve RPC endpoint: {error}").into()))?;
-        let remote = addresses
-            .next()
-            .ok_or_else(|| Error::Channel("RPC endpoint resolved to no addresses".into()))?;
-        Ok(Self::rpc(remote, protocol))
     }
 
     /// Creates a single-server channel using the default bRPC protocol.
@@ -207,12 +253,64 @@ impl RpcChannel {
     }
 
     pub(crate) fn with_options(remote: SocketAddr, options: ChannelOptions) -> Result<Self> {
-        if matches!(options.connection_mode, ConnectionMode::Pool { size: 0 }) {
-            return Err(Error::Channel("connection pool size must be greater than zero".into()));
-        }
+        validate_options(&options)?;
         Ok(Self {
-            inner: Arc::new(ChannelInner { remote, options, next_connection: AtomicU64::new(0) }),
+            inner: Arc::new(ChannelInner {
+                target: Route::Static(Endpoint::new(EndpointId::new(0), remote)),
+                options,
+                next_connection: AtomicU64::new(0),
+            }),
         })
+    }
+
+    fn with_uri_options(target: &str, options: ChannelOptions) -> Result<Self> {
+        let (scheme, address) = target
+            .split_once("://")
+            .ok_or_else(|| Error::Channel("RPC target must use scheme://address syntax".into()))?;
+        if address.is_empty() {
+            return Err(Error::Channel("RPC target address must not be empty".into()));
+        }
+        validate_options(&options)?;
+        let service =
+            ServiceName::new(address).map_err(|error| Error::Channel(error.to_string().into()))?;
+        if scheme.eq_ignore_ascii_case("list") {
+            let snapshot =
+                resolve_list(&service).map_err(|error| Error::Channel(error.to_string().into()))?;
+            let target = Arc::new(DynamicTarget {
+                service,
+                route: DynamicRoute::new(),
+                cancel: CancellationToken::new(),
+            });
+            target.route.publish(snapshot);
+            return Ok(Self::from_dynamic_target(target, options));
+        }
+        let naming = resolve_naming_service(scheme)
+            .map_err(|error| Error::Channel(error.to_string().into()))?;
+        let handle = tokio::runtime::Handle::try_current().map_err(|error| {
+            Error::Channel(format!("dynamic RPC channel requires a Tokio runtime: {error}").into())
+        })?;
+        let target = Arc::new(DynamicTarget {
+            service: service.clone(),
+            route: DynamicRoute::new(),
+            cancel: CancellationToken::new(),
+        });
+        handle.spawn(run_naming_watch(
+            Arc::downgrade(&target),
+            target.cancel.clone(),
+            naming,
+            service,
+        ));
+        Ok(Self::from_dynamic_target(target, options))
+    }
+
+    fn from_dynamic_target(target: Arc<DynamicTarget>, options: ChannelOptions) -> Self {
+        Self {
+            inner: Arc::new(ChannelInner {
+                target: Route::Dynamic(target),
+                options,
+                next_connection: AtomicU64::new(0),
+            }),
+        }
     }
 
     /// Creates another logical channel which shares all configuration except
@@ -223,15 +321,20 @@ impl RpcChannel {
         options.connection_tag = connection_tag;
         Self {
             inner: Arc::new(ChannelInner {
-                remote: self.inner.remote,
+                target: self.inner.target.clone(),
                 options,
                 next_connection: AtomicU64::new(0),
             }),
         }
     }
 
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.inner.remote
+    /// Returns the fixed peer address, or `None` for a service-discovery
+    /// channel.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        match &self.inner.target {
+            Route::Static(endpoint) => Some(endpoint.address()),
+            Route::Dynamic(_) => None,
+        }
     }
 
     pub(crate) fn options(&self) -> &ChannelOptions {
@@ -263,14 +366,17 @@ impl RpcChannel {
             ConnectionMode::Pool { size } => size,
             ConnectionMode::Short => 0,
         };
-        for slot in 0..slots {
-            let key = self.connection_key_for_slot(self.connection_tag(), slot as u32);
-            match self.wire_protocol() {
-                Protocol::Brpc => super::brpc::close_cached(&key),
-                Protocol::Grpc => crate::protocol::grpc::client::close_cached(&key),
-                Protocol::Http1 | Protocol::Http2 => unreachable!("RPC channel protocol"),
+        self.visit_endpoints(|endpoint| {
+            for slot in 0..slots {
+                let key =
+                    self.connection_key_for_slot(endpoint, self.connection_tag(), slot as u32);
+                match self.wire_protocol() {
+                    Protocol::Brpc => super::brpc::close_cached(&key),
+                    Protocol::Grpc => crate::protocol::grpc::client::close_cached(&key),
+                    Protocol::Http1 | Protocol::Http2 => unreachable!("RPC channel protocol"),
+                }
             }
-        }
+        });
     }
 
     /// Creates an unstarted unary RPC.
@@ -323,34 +429,159 @@ impl RpcChannel {
 
     #[cfg(test)]
     pub(crate) fn connection_key(&self) -> ConnectionKey {
-        self.connection_key_with_tag(None)
+        let endpoint = self.pick_endpoint().expect("test channel has an endpoint");
+        self.connection_key_with_tag(endpoint, None)
     }
 
     /// Computes a key with an optional call-local tag override, without
     /// allocating another logical channel on the call-start path.
     pub(crate) fn connection_key_with_tag(
         &self,
+        endpoint: Endpoint,
         connection_tag: Option<ConnectionTag>,
     ) -> ConnectionKey {
         self.connection_key_for_slot(
+            endpoint,
             connection_tag.unwrap_or_else(|| self.connection_tag()),
             self.connection_slot(),
         )
     }
 
-    fn connection_key_for_slot(&self, tag: ConnectionTag, slot: u32) -> ConnectionKey {
+    fn connection_key_for_slot(
+        &self,
+        endpoint: Endpoint,
+        tag: ConnectionTag,
+        slot: u32,
+    ) -> ConnectionKey {
         ConnectionKey {
-            remote: self.remote_addr(),
+            remote: endpoint.address(),
+            endpoint_id: endpoint.id().get(),
             tag: tag.get(),
             slot,
             connect_timeout: self.inner.options.connect_timeout,
+        }
+    }
+
+    pub(crate) fn pick_endpoint(&self) -> Result<Endpoint, crate::Status> {
+        match &self.inner.target {
+            Route::Static(endpoint) => Ok(*endpoint),
+            Route::Dynamic(target) => target.route.pick(&target.service),
+        }
+    }
+
+    pub(crate) fn static_endpoint(&self) -> Endpoint {
+        match &self.inner.target {
+            Route::Static(endpoint) => *endpoint,
+            Route::Dynamic(_) => panic!("HTTP clients cannot use a dynamic RPC route"),
+        }
+    }
+
+    fn visit_endpoints(&self, mut visitor: impl FnMut(Endpoint)) {
+        match &self.inner.target {
+            Route::Static(endpoint) => visitor(*endpoint),
+            Route::Dynamic(target) => target.route.visit(visitor),
+        }
+    }
+}
+
+fn validate_options(options: &ChannelOptions) -> Result<()> {
+    if matches!(options.connection_mode, ConnectionMode::Pool { size: 0 }) {
+        return Err(Error::Channel("connection pool size must be greater than zero".into()));
+    }
+    Ok(())
+}
+
+async fn run_naming_watch(
+    target: Weak<DynamicTarget>,
+    cancel: CancellationToken,
+    naming: Arc<dyn NamingService>,
+    service: ServiceName,
+) {
+    let mut watch = naming.watch(service.clone());
+    let mut expiry = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut expiry_active = false;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = &mut expiry, if expiry_active => {
+                let Some(target) = target.upgrade() else { return };
+                target.route.expire();
+                expiry_active = false;
+            }
+            update = watch.next() => {
+                match update {
+                    Some(Ok(snapshot)) => {
+                        let Some(target) = target.upgrade() else { return };
+                        let ttl = snapshot.ttl();
+                        target.route.publish(snapshot);
+                        if let Some(ttl) = ttl {
+                            expiry.as_mut().reset(tokio::time::Instant::now() + ttl);
+                            expiry_active = true;
+                        } else {
+                            expiry_active = false;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        log::warn!("naming update failed: service={}, error={error}", service);
+                    }
+                    None => {
+                        log::warn!("naming watch ended: service={service}");
+                        if expiry_active {
+                            tokio::select! {
+                                _ = cancel.cancelled() => {}
+                                _ = &mut expiry => {
+                                    if let Some(target) = target.upgrade() {
+                                        target.route.expire();
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
     use super::*;
+    use crate::{EndpointSnapshot, NamingError, NamingWatch, StatusCode};
+
+    struct TestNaming {
+        receiver: Mutex<Option<mpsc::Receiver<Result<EndpointSnapshot, NamingError>>>>,
+    }
+
+    impl NamingService for TestNaming {
+        fn watch(&self, _service: ServiceName) -> NamingWatch {
+            let receiver = self.receiver.lock().unwrap().take().unwrap();
+            Box::pin(ReceiverStream::new(receiver))
+        }
+    }
+
+    fn test_endpoint(id: u64, port: u16) -> Endpoint {
+        Endpoint::new(EndpointId::new(id), ([127, 0, 0, 1], port).into())
+    }
+
+    async fn wait_for_endpoint(channel: &RpcChannel) -> Endpoint {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(endpoint) = channel.pick_endpoint() {
+                    return endpoint;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
 
     #[test]
     fn tagged_channels_share_configuration_but_not_connection_keys() {
@@ -380,17 +611,89 @@ mod tests {
         assert_eq!(channel.connection_key().slot, 0);
     }
 
-    #[tokio::test]
-    async fn endpoint_builder_resolves_host_and_preserves_connect_policy() {
-        let channel = RpcChannel::grpc_endpoint(("localhost", 8080))
-            .await
-            .unwrap()
-            .connect_timeout(Duration::from_millis(25))
-            .build()
-            .unwrap();
+    #[test]
+    fn dynamic_route_uses_round_robin_without_resetting_on_update() {
+        let route = DynamicRoute::new();
+        let service = ServiceName::new("echo").unwrap();
+        route.publish(
+            EndpointSnapshot::new(
+                [test_endpoint(1, 8001), test_endpoint(2, 8002)],
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
 
-        assert_eq!(channel.remote_addr().port(), 8080);
-        assert_eq!(channel.protocol(), RpcProtocol::Grpc);
-        assert_eq!(channel.connection_key().connect_timeout, Some(Duration::from_millis(25)));
+        assert_eq!(route.pick(&service).unwrap().id(), EndpointId::new(1));
+        assert_eq!(route.pick(&service).unwrap().id(), EndpointId::new(2));
+        assert_eq!(route.pick(&service).unwrap().id(), EndpointId::new(1));
+
+        route.publish(
+            EndpointSnapshot::new(
+                [test_endpoint(1, 8001), test_endpoint(2, 8002)],
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        assert_eq!(route.pick(&service).unwrap().id(), EndpointId::new(2));
+    }
+
+    #[tokio::test]
+    async fn dynamic_channel_fails_fast_then_keeps_snapshot_until_ttl() {
+        let (sender, receiver) = mpsc::channel(4);
+        let naming = Arc::new(TestNaming { receiver: Mutex::new(Some(receiver)) });
+        crate::register_naming_service("test-channel", naming).unwrap();
+        let channel = RpcChannel::brpc("test-channel://echo").build().unwrap();
+
+        let initial = channel.pick_endpoint().unwrap_err();
+        assert_eq!(initial.code(), StatusCode::Unavailable);
+
+        sender
+            .send(Ok(
+                EndpointSnapshot::new([test_endpoint(7, 8007)], Duration::from_millis(80)).unwrap()
+            ))
+            .await
+            .unwrap();
+        wait_for_endpoint(&channel).await;
+
+        sender.send(Err(NamingError::new("temporary failure"))).await.unwrap();
+        assert_eq!(channel.pick_endpoint().unwrap().id(), EndpointId::new(7));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(channel.pick_endpoint().unwrap_err().code(), StatusCode::Unavailable);
+    }
+
+    #[test]
+    fn endpoint_identity_separates_cached_connection_keys() {
+        let channel = Channel::new("127.0.0.1:8080".parse().unwrap());
+        let first = channel.connection_key_with_tag(test_endpoint(1, 8080), None);
+        let second = channel.connection_key_with_tag(test_endpoint(2, 8080), None);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn endpoint_builds_a_fixed_channel() {
+        let endpoint: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let channel = RpcChannel::grpc(endpoint).build().unwrap();
+        assert_eq!(channel.remote_addr(), Some(endpoint));
+    }
+
+    #[test]
+    fn list_target_is_permanent_and_round_robins_endpoints() {
+        let channel = RpcChannel::grpc("list://127.0.0.1:8001,127.0.0.1:8002").build().unwrap();
+        assert_eq!(channel.pick_endpoint().unwrap().address().port(), 8001);
+        assert_eq!(channel.pick_endpoint().unwrap().address().port(), 8002);
+        assert_eq!(channel.pick_endpoint().unwrap().address().port(), 8001);
+    }
+
+    #[test]
+    fn invalid_list_target_fails_during_build() {
+        let error = RpcChannel::grpc("list://127.0.0.1:8001,").build().unwrap_err();
+        assert!(error.to_string().contains("empty endpoint"));
+    }
+
+    #[tokio::test]
+    async fn dns_target_resolves_all_addresses() {
+        let channel = RpcChannel::grpc("dns://localhost:8080").build().unwrap();
+        assert_eq!(wait_for_endpoint(&channel).await.address().port(), 8080);
     }
 }

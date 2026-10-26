@@ -43,19 +43,20 @@ impl HttpClient {
         deadline: Option<Instant>,
         connection_tag: Option<super::ConnectionTag>,
     ) -> HttpCall {
+        let endpoint = self.channel.static_endpoint();
         match self.channel.options().connection_mode {
             ConnectionMode::Single | ConnectionMode::Pool { .. } => {
                 match self.channel.wire_protocol() {
                     crate::Protocol::Http1 => {
-                        match HTTP1_CONNECTIONS
-                            .get_or_create(self.channel.connection_key_with_tag(connection_tag))
-                        {
+                        match HTTP1_CONNECTIONS.get_or_create(
+                            self.channel.connection_key_with_tag(endpoint, connection_tag),
+                        ) {
                             Ok(session) => session.issue_request(request, deadline),
                             Err(error) => HttpCall::ready(Err(error)),
                         }
                     }
                     crate::Protocol::Http2 => {
-                        let key = self.channel.connection_key_with_tag(connection_tag);
+                        let key = self.channel.connection_key_with_tag(endpoint, connection_tag);
                         match Http2ClientSession::get_or_create(key, false) {
                             Ok(session) => {
                                 let (parts, body) = request.into_parts();
@@ -75,13 +76,11 @@ impl HttpClient {
                 }
             }
             ConnectionMode::Short => match self.channel.wire_protocol() {
-                crate::Protocol::Http1 => Http1ClientSession::issue_short_request(
-                    self.channel.remote_addr(),
-                    request,
-                    deadline,
-                ),
+                crate::Protocol::Http1 => {
+                    Http1ClientSession::issue_short_request(endpoint.address(), request, deadline)
+                }
                 crate::Protocol::Http2 => {
-                    let key = self.channel.connection_key_with_tag(connection_tag);
+                    let key = self.channel.connection_key_with_tag(endpoint, connection_tag);
                     match Http2ClientSession::get_or_create(key, true) {
                         Ok(session) => {
                             let (parts, body) = request.into_parts();
@@ -106,17 +105,18 @@ impl HttpClient {
         deadline: Option<Instant>,
         connection_tag: Option<super::ConnectionTag>,
     ) -> HttpCall {
+        let endpoint = self.channel.static_endpoint();
         match self.channel.options().connection_mode {
             ConnectionMode::Single | ConnectionMode::Pool { .. } => {
                 match self.channel.wire_protocol() {
-                    crate::Protocol::Http1 => match HTTP1_CONNECTIONS
-                        .get_or_create(self.channel.connection_key_with_tag(connection_tag))
-                    {
+                    crate::Protocol::Http1 => match HTTP1_CONNECTIONS.get_or_create(
+                        self.channel.connection_key_with_tag(endpoint, connection_tag),
+                    ) {
                         Ok(session) => session.issue_streaming_request(parts, body, deadline),
                         Err(error) => HttpCall::ready(Err(error)),
                     },
                     crate::Protocol::Http2 => {
-                        let key = self.channel.connection_key_with_tag(connection_tag);
+                        let key = self.channel.connection_key_with_tag(endpoint, connection_tag);
                         match Http2ClientSession::get_or_create(key, false) {
                             Ok(session) => {
                                 match session.issue(RequestBody::Streaming(body), parts, deadline) {
@@ -133,7 +133,7 @@ impl HttpClient {
             ConnectionMode::Short => match self.channel.wire_protocol() {
                 crate::Protocol::Http1 => {
                     match Http1ClientSession::create(
-                        self.channel.remote_addr(),
+                        endpoint.address(),
                         self.channel.options().connect_timeout,
                         true,
                     ) {
@@ -142,7 +142,7 @@ impl HttpClient {
                     }
                 }
                 crate::Protocol::Http2 => {
-                    let key = self.channel.connection_key_with_tag(connection_tag);
+                    let key = self.channel.connection_key_with_tag(endpoint, connection_tag);
                     match Http2ClientSession::get_or_create(key, true) {
                         Ok(session) => {
                             match session.issue(RequestBody::Streaming(body), parts, deadline) {
