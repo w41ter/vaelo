@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::{MetadataMap as TonicMetadataMap, MetadataValue as TonicMetadataValue};
 use tonic::transport::{Endpoint, Server as TonicServer};
 use tonic::{
@@ -34,7 +35,15 @@ const RESPONSE_METADATA: &[u8] = b"\xff\0response-context";
 const LATE_RESPONSE_PAYLOAD: &[u8] = b"interop-late-response";
 const EARLY_STREAM_RESPONSE_PAYLOAD: &[u8] = b"interop-early-stream-response";
 const LONG_STREAM_PAYLOAD: &[u8] = b"interop-long-stream";
+const SLOW_STREAM_PAYLOAD: &[u8] = b"interop-slow-stream";
 const STREAM_ERROR_PAYLOAD: &[u8] = b"interop-stream-error";
+const PARTIAL_STREAM_ERROR_PAYLOAD: &[u8] = b"interop-partial-stream-error";
+const DEADLINE_PAYLOAD: &[u8] = b"interop-deadline";
+const ASCII_METADATA_PAYLOAD: &[u8] = b"interop-ascii-metadata";
+const SUCCESS_TRAILERS_PAYLOAD: &[u8] = b"interop-success-trailers";
+const OVERSIZED_RESPONSE_PAYLOAD: &[u8] = b"interop-oversized-response";
+const ASCII_METADATA_KEY: &str = "test-ascii-metadata";
+const TRAILING_METADATA_KEY: &str = "test-trailer";
 
 pub mod perf {
     tonic::include_proto!("perf");
@@ -115,6 +124,24 @@ async fn run_checks() -> Result<(), Box<dyn std::error::Error>> {
     check_tonic_client_streaming_client_to_vaelo_server(vaelo_server.address, payload.clone())
         .await?;
     check_tonic_bidi_streaming_client_to_vaelo_server(vaelo_server.address, payload).await?;
+    check_stream_cancellation_preserves_connections(
+        tonic_server.address,
+        &tonic_server.cancellations_seen,
+        vaelo_server.address,
+        &vaelo_server.cancellations_seen,
+    )
+    .await?;
+    check_slow_consumers_bidirectional(tonic_server.address, vaelo_server.address).await?;
+    check_empty_messages_and_streams(tonic_server.address, vaelo_server.address).await?;
+    check_large_messages_bidirectional(tonic_server.address, vaelo_server.address).await?;
+    check_message_size_limits(tonic_server.address, vaelo_server.address).await?;
+    check_deadlines_bidirectional(
+        tonic_server.address,
+        &tonic_server.deadlines_seen,
+        vaelo_server.address,
+        &vaelo_server.deadlines_seen,
+    )
+    .await?;
     check_vaelo_client_reads_tonic_status_details(tonic_server.address).await?;
     check_error_then_success_reuses_connection(tonic_server.address).await?;
     check_many_sequential_status_transitions(tonic_server.address).await?;
@@ -125,6 +152,11 @@ async fn run_checks() -> Result<(), Box<dyn std::error::Error>> {
     check_tonic_client_reads_vaelo_status_details(vaelo_server.address).await?;
     check_vaelo_client_binary_metadata_with_tonic_server(tonic_server.address).await?;
     check_tonic_client_binary_metadata_with_vaelo_server(vaelo_server.address).await?;
+    check_ascii_duplicate_metadata_bidirectional(tonic_server.address, vaelo_server.address)
+        .await?;
+    check_tonic_client_reads_vaelo_success_trailers(vaelo_server.address).await?;
+    check_partial_stream_errors_bidirectional(tonic_server.address, vaelo_server.address).await?;
+    check_tonic_compression_is_rejected_without_poisoning_connection(vaelo_server.address).await?;
     check_late_headers_after_timeout_do_not_break_connection(tonic_server.address).await?;
     check_client_streaming_observes_early_response(tonic_server.address).await?;
 
@@ -242,6 +274,8 @@ async fn check_vaelo_bidi_streaming_client_to_tonic_server(
 struct TonicServerHandle {
     address: SocketAddr,
     accepted_connections: Arc<AtomicUsize>,
+    deadlines_seen: Arc<AtomicUsize>,
+    cancellations_seen: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -261,20 +295,33 @@ fn start_tonic_server_with_listener(
 ) -> Result<TonicServerHandle, Box<dyn std::error::Error>> {
     let address = listener.local_addr()?;
     let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let deadlines_seen = Arc::new(AtomicUsize::new(0));
+    let cancellations_seen = Arc::new(AtomicUsize::new(0));
     let incoming = CountingIncoming {
         inner: tokio_stream::wrappers::TcpListenerStream::new(listener),
         accepted_connections: accepted_connections.clone(),
     };
+    let service_deadlines_seen = deadlines_seen.clone();
+    let service_cancellations_seen = cancellations_seen.clone();
     let task = tokio::spawn(async move {
         let result = TonicServer::builder()
-            .add_service(EchoServiceServer::new(TonicEchoService))
+            .add_service(EchoServiceServer::new(TonicEchoService {
+                deadlines_seen: service_deadlines_seen,
+                cancellations_seen: service_cancellations_seen,
+            }))
             .serve_with_incoming(incoming)
             .await;
         if let Err(error) = result {
             eprintln!("tonic server failed: {error}");
         }
     });
-    Ok(TonicServerHandle { address, accepted_connections, task })
+    Ok(TonicServerHandle {
+        address,
+        accepted_connections,
+        deadlines_seen,
+        cancellations_seen,
+        task,
+    })
 }
 
 struct CountingIncoming {
@@ -295,8 +342,10 @@ impl tokio_stream::Stream for CountingIncoming {
     }
 }
 
-#[derive(Default)]
-struct TonicEchoService;
+struct TonicEchoService {
+    deadlines_seen: Arc<AtomicUsize>,
+    cancellations_seen: Arc<AtomicUsize>,
+}
 
 #[tonic::async_trait]
 impl EchoService for TonicEchoService {
@@ -309,6 +358,12 @@ impl EchoService for TonicEchoService {
     ) -> Result<TonicResponse<EchoResponse>, TonicStatus> {
         let request_metadata = request.metadata().clone();
         let payload = request.into_inner().payload;
+        if payload == DEADLINE_PAYLOAD {
+            if request_metadata.get("grpc-timeout").is_some() {
+                self.deadlines_seen.fetch_add(1, Ordering::Relaxed);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         if payload == LATE_RESPONSE_PAYLOAD {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -325,6 +380,11 @@ impl EchoService for TonicEchoService {
                 metadata,
             ));
         }
+        let payload = if payload == OVERSIZED_RESPONSE_PAYLOAD {
+            vec![b'x'; 4 * 1024 * 1024 + 1]
+        } else {
+            payload
+        };
         let mut response = TonicResponse::new(EchoResponse { payload });
         if response.get_ref().payload == METADATA_PAYLOAD {
             assert_eq!(
@@ -340,6 +400,16 @@ impl EchoService for TonicEchoService {
                 TonicMetadataValue::from_bytes(RESPONSE_METADATA),
             );
         }
+        if response.get_ref().payload == ASCII_METADATA_PAYLOAD {
+            let actual = request_metadata
+                .get_all(ASCII_METADATA_KEY)
+                .iter()
+                .map(|value| value.to_str().expect("ASCII request metadata"))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, ["first", "second"]);
+            response.metadata_mut().append(ASCII_METADATA_KEY, "first-response".parse().unwrap());
+            response.metadata_mut().append(ASCII_METADATA_KEY, "second-response".parse().unwrap());
+        }
         Ok(response)
     }
 
@@ -348,11 +418,35 @@ impl EchoService for TonicEchoService {
         request: TonicRequest<EchoRequest>,
     ) -> Result<TonicResponse<Self::ExpandStream>, TonicStatus> {
         let payload = request.into_inner().payload;
+        let cancellations_seen = self.cancellations_seen.clone();
         let (sender, receiver) = mpsc::channel(4);
         tokio::spawn(async move {
             if payload == LONG_STREAM_PAYLOAD {
-                let _ = sender.send(Ok(EchoResponse { payload })).await;
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                if sender.send(Ok(EchoResponse { payload })).await.is_ok() {
+                    sender.closed().await;
+                    cancellations_seen.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+            if payload == PARTIAL_STREAM_ERROR_PAYLOAD {
+                let _ = sender.send(Ok(EchoResponse { payload: b"before-error".to_vec() })).await;
+                let mut metadata = TonicMetadataMap::new();
+                metadata.insert(TRAILING_METADATA_KEY, "tonic-error-trailer".parse().unwrap());
+                let _ = sender
+                    .send(Err(TonicStatus::with_metadata(
+                        TonicCode::DataLoss,
+                        "tonic stream failed after one message",
+                        metadata,
+                    )))
+                    .await;
+                return;
+            }
+            if payload == SLOW_STREAM_PAYLOAD {
+                for payload in slow_stream_payloads() {
+                    if sender.send(Ok(EchoResponse { payload })).await.is_err() {
+                        return;
+                    }
+                }
                 return;
             }
             for index in 0..3 {
@@ -406,23 +500,55 @@ struct VaeloServerHandle {
     server: Server,
     address: SocketAddr,
     seen_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+    deadlines_seen: Arc<AtomicUsize>,
+    cancellations_seen: Arc<AtomicUsize>,
 }
 
 async fn start_vaelo_server() -> Result<VaeloServerHandle, Box<dyn std::error::Error>> {
     let seen_remotes = Arc::new(Mutex::new(HashSet::new()));
+    let deadlines_seen = Arc::new(AtomicUsize::new(0));
+    let cancellations_seen = Arc::new(AtomicUsize::new(0));
     let services = ServiceRegistryBuilder::default()
-        .add_service(VaeloEchoService { seen_remotes: seen_remotes.clone() })
+        .add_service(VaeloEchoService {
+            seen_remotes: seen_remotes.clone(),
+            deadlines_seen: deadlines_seen.clone(),
+            cancellations_seen: cancellations_seen.clone(),
+        })
         .build();
     let acceptor = RpcAcceptor::new(services).allow_protocols(ProtocolSet::only(Protocol::Http2));
     let mut server = Server::new();
     let listener = server.listen_tcp("127.0.0.1:0", acceptor).await?;
     let address = listener.local_addr();
-    Ok(VaeloServerHandle { server, address, seen_remotes })
+    Ok(VaeloServerHandle { server, address, seen_remotes, deadlines_seen, cancellations_seen })
 }
 
 #[derive(Clone)]
 struct VaeloEchoService {
     seen_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+    deadlines_seen: Arc<AtomicUsize>,
+    cancellations_seen: Arc<AtomicUsize>,
+}
+
+struct CancellationObservedStream {
+    first: Option<EchoResponse>,
+    cancellations_seen: Arc<AtomicUsize>,
+}
+
+impl tokio_stream::Stream for CancellationObservedStream {
+    type Item = Result<EchoResponse, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.first.take() {
+            Some(first) => Poll::Ready(Some(Ok(first))),
+            None => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for CancellationObservedStream {
+    fn drop(&mut self) {
+        self.cancellations_seen.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl VaeloEchoService {
@@ -431,8 +557,14 @@ impl VaeloEchoService {
             .lock()
             .expect("remote address set lock poisoned")
             .insert(request.remote_addr().expect("server request has a remote address"));
-        let request_metadata = request.metadata().clone();
-        let payload = request.into_inner().payload;
+        let (context, request) = request.into_parts();
+        let request_metadata = context.metadata().clone();
+        let payload = request.payload;
+        if payload == DEADLINE_PAYLOAD {
+            assert!(context.deadline().is_some(), "tonic deadline must reach vaelo service");
+            self.deadlines_seen.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         if payload == ERROR_PAYLOAD {
             let mut status = Status::new(StatusCode::FailedPrecondition, ERROR_MESSAGE)
                 .with_details(ERROR_DETAILS.to_vec());
@@ -450,6 +582,20 @@ impl VaeloEchoService {
                 .insert("response-context-bin", RESPONSE_METADATA.to_vec())
                 .expect("valid binary metadata key");
         }
+        if response.get_ref().payload == ASCII_METADATA_PAYLOAD {
+            assert_eq!(
+                request_metadata.get_all(ASCII_METADATA_KEY).collect::<Vec<_>>(),
+                [b"first".as_slice(), b"second".as_slice()]
+            );
+            response
+                .metadata_mut()
+                .append(ASCII_METADATA_KEY, b"first-response".to_vec())
+                .expect("valid ASCII metadata key");
+            response
+                .metadata_mut()
+                .append(ASCII_METADATA_KEY, b"second-response".to_vec())
+                .expect("valid ASCII metadata key");
+        }
         Ok(response)
     }
 
@@ -457,9 +603,7 @@ impl VaeloEchoService {
         &self,
         request: Request<EchoRequest>,
     ) -> Result<
-        Response<
-            impl tokio_stream::Stream<Item = Result<EchoResponse, Status>> + Send + 'static + use<>,
-        >,
+        Response<Pin<Box<dyn tokio_stream::Stream<Item = Result<EchoResponse, Status>> + Send>>>,
         Status,
     > {
         if request.get_ref().payload == STREAM_ERROR_PAYLOAD {
@@ -470,13 +614,40 @@ impl VaeloEchoService {
             .expect("remote address set lock poisoned")
             .insert(request.remote_addr().expect("server request has a remote address"));
         let request = request.into_inner();
+        if request.payload == LONG_STREAM_PAYLOAD {
+            return Ok(Response::new(Box::pin(CancellationObservedStream {
+                first: Some(EchoResponse { payload: request.payload }),
+                cancellations_seen: self.cancellations_seen.clone(),
+            })));
+        }
+        if request.payload == PARTIAL_STREAM_ERROR_PAYLOAD {
+            return Ok(Response::new(Box::pin(tokio_stream::iter(vec![
+                Ok(EchoResponse { payload: b"before-error".to_vec() }),
+                Err(Status::new(StatusCode::DataLoss, "vaelo stream failed after one message")),
+            ]))));
+        }
+        if request.payload == SLOW_STREAM_PAYLOAD {
+            let responses = slow_stream_payloads()
+                .into_iter()
+                .map(|payload| Ok(EchoResponse { payload }))
+                .collect::<Vec<_>>();
+            return Ok(Response::new(Box::pin(tokio_stream::iter(responses))));
+        }
         let mut responses = Vec::new();
         for index in 0..3 {
             let mut payload = request.payload.clone();
             payload.push(index);
             responses.push(Ok(EchoResponse { payload }));
         }
-        Ok(Response::new(tokio_stream::iter(responses)))
+        let mut response = Response::new(Box::pin(tokio_stream::iter(responses))
+            as Pin<Box<dyn tokio_stream::Stream<Item = Result<EchoResponse, Status>> + Send>>);
+        if request.payload == SUCCESS_TRAILERS_PAYLOAD {
+            response
+                .trailers_mut()
+                .append(TRAILING_METADATA_KEY, b"vaelo-success-trailer".to_vec())
+                .expect("valid trailing metadata key");
+        }
+        Ok(response)
     }
 
     async fn collect(
@@ -557,6 +728,385 @@ impl RegisterService for VaeloEchoService {
             ),
         );
     }
+}
+
+async fn check_stream_cancellation_preserves_connections(
+    tonic_address: SocketAddr,
+    tonic_cancellations_seen: &AtomicUsize,
+    vaelo_address: SocketAddr,
+    vaelo_cancellations_seen: &AtomicUsize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let before = tonic_cancellations_seen.load(Ordering::Relaxed);
+    let channel = grpc_channel(tonic_address);
+    let response = channel
+        .server_streaming::<_, EchoResponse>(
+            &EXPAND_METHOD,
+            EchoRequest { payload: LONG_STREAM_PAYLOAD.to_vec() }.into(),
+        )
+        .timeout(Duration::from_secs(2))
+        .await?;
+    let mut stream = response.into_inner();
+    assert_eq!(stream.message().await?.unwrap().payload, LONG_STREAM_PAYLOAD);
+    drop(stream);
+    wait_for_counter(tonic_cancellations_seen, before + 1).await?;
+    let response = channel
+        .call::<_, EchoResponse>(
+            &ECHO_METHOD,
+            EchoRequest { payload: b"after tonic stream cancellation".to_vec() }.into(),
+        )
+        .timeout(Duration::from_secs(2))
+        .await?;
+    assert_eq!(response.payload, b"after tonic stream cancellation");
+
+    let before = vaelo_cancellations_seen.load(Ordering::Relaxed);
+    let channel = tonic_channel(vaelo_address).await?;
+    let response = EchoServiceClient::new(channel.clone())
+        .expand(EchoRequest { payload: LONG_STREAM_PAYLOAD.to_vec() })
+        .await?;
+    let mut stream = response.into_inner();
+    assert_eq!(stream.message().await?.unwrap().payload, LONG_STREAM_PAYLOAD);
+    drop(stream);
+    wait_for_counter(vaelo_cancellations_seen, before + 1).await?;
+    let response = EchoServiceClient::new(channel)
+        .echo(EchoRequest { payload: b"after vaelo stream cancellation".to_vec() })
+        .await?;
+    assert_eq!(response.into_inner().payload, b"after vaelo stream cancellation");
+    println!(
+        "stream cancellation releases server work and preserves connections both directions: ok"
+    );
+    Ok(())
+}
+
+async fn check_slow_consumers_bidirectional(
+    tonic_address: SocketAddr,
+    vaelo_address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = slow_stream_payloads();
+    let response = grpc_channel(tonic_address)
+        .server_streaming::<_, EchoResponse>(
+            &EXPAND_METHOD,
+            EchoRequest { payload: SLOW_STREAM_PAYLOAD.to_vec() }.into(),
+        )
+        .timeout(Duration::from_secs(5))
+        .await?;
+    let mut stream = response.into_inner();
+    let mut actual = Vec::new();
+    while let Some(message) = stream.message().await? {
+        actual.push(message.payload);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(actual, expected);
+
+    let response = EchoServiceClient::new(tonic_channel(vaelo_address).await?)
+        .expand(EchoRequest { payload: SLOW_STREAM_PAYLOAD.to_vec() })
+        .await?;
+    let mut stream = response.into_inner();
+    let mut actual = Vec::new();
+    while let Some(message) = stream.message().await? {
+        actual.push(message.payload);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(actual, expected);
+    println!("slow consumers preserve ordered streaming data both directions: ok");
+    Ok(())
+}
+
+async fn wait_for_counter(
+    counter: &AtomicUsize,
+    expected: usize,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while counter.load(Ordering::Relaxed) < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+}
+
+async fn check_empty_messages_and_streams(
+    tonic_address: SocketAddr,
+    vaelo_address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = grpc_channel(tonic_address)
+        .call::<_, EchoResponse>(&ECHO_METHOD, EchoRequest { payload: Vec::new() }.into())
+        .timeout(Duration::from_secs(2))
+        .await?;
+    assert!(response.payload.is_empty());
+
+    let channel = tonic_channel(vaelo_address).await?;
+    let response =
+        EchoServiceClient::new(channel.clone()).echo(EchoRequest { payload: Vec::new() }).await?;
+    assert!(response.into_inner().payload.is_empty());
+
+    let call = grpc_channel(tonic_address)
+        .client_streaming::<EchoRequest, EchoResponse>(&COLLECT_METHOD)
+        .timeout(Duration::from_secs(2))
+        .start();
+    let response = call.finish().await?;
+    assert!(response.payload.is_empty());
+
+    let response = EchoServiceClient::new(channel.clone())
+        .collect(tokio_stream::empty::<EchoRequest>())
+        .await?;
+    assert!(response.into_inner().payload.is_empty());
+
+    let (mut sender, response) = grpc_channel(tonic_address)
+        .bidirectional_streaming::<EchoRequest, EchoResponse>(&CHAT_METHOD)
+        .timeout(Duration::from_secs(2))
+        .start()
+        .into_parts();
+    sender.finish().await?;
+    let mut stream = response.await?.into_inner();
+    assert!(stream.message().await?.is_none());
+
+    let response =
+        EchoServiceClient::new(channel).chat(tokio_stream::empty::<EchoRequest>()).await?;
+    let mut stream = response.into_inner();
+    assert!(stream.message().await?.is_none());
+    println!("empty unary messages and empty client/bidi streams interoperate: ok");
+    Ok(())
+}
+
+async fn check_large_messages_bidirectional(
+    tonic_address: SocketAddr,
+    vaelo_address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = vec![b'l'; 256 * 1024];
+    let response = grpc_channel(tonic_address)
+        .call::<_, EchoResponse>(&ECHO_METHOD, EchoRequest { payload: payload.clone() }.into())
+        .timeout(Duration::from_secs(3))
+        .await?;
+    assert_eq!(response.payload, payload);
+
+    let channel = tonic_channel(vaelo_address).await?;
+    let response = EchoServiceClient::new(channel.clone())
+        .echo(EchoRequest { payload: payload.clone() })
+        .await?;
+    assert_eq!(response.into_inner().payload, payload);
+
+    let response = grpc_channel(tonic_address)
+        .server_streaming::<_, EchoResponse>(
+            &EXPAND_METHOD,
+            EchoRequest { payload: payload.clone() }.into(),
+        )
+        .timeout(Duration::from_secs(3))
+        .await?;
+    let mut stream = response.into_inner();
+    let mut actual = Vec::new();
+    while let Some(message) = stream.message().await? {
+        actual.push(message.payload);
+    }
+    assert_eq!(actual, expanded_payloads(&payload));
+
+    let response =
+        EchoServiceClient::new(channel).expand(EchoRequest { payload: payload.clone() }).await?;
+    let mut stream = response.into_inner();
+    let mut actual = Vec::new();
+    while let Some(message) = stream.message().await? {
+        actual.push(message.payload);
+    }
+    assert_eq!(actual, expanded_payloads(&payload));
+    println!("messages larger than the initial H2 window interoperate both directions: ok");
+    Ok(())
+}
+
+async fn check_message_size_limits(
+    tonic_address: SocketAddr,
+    vaelo_address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let channel = tonic_channel(vaelo_address).await?;
+    let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+    let error = EchoServiceClient::new(channel.clone())
+        .max_encoding_message_size(8 * 1024 * 1024)
+        .echo(EchoRequest { payload: oversized })
+        .await
+        .expect_err("vaelo must reject a request over its decoding limit");
+    assert_eq!(error.code(), TonicCode::ResourceExhausted);
+    let response = EchoServiceClient::new(channel)
+        .echo(EchoRequest { payload: b"after oversized request".to_vec() })
+        .await?;
+    assert_eq!(response.into_inner().payload, b"after oversized request");
+
+    let vaelo_channel = grpc_channel(tonic_address);
+    let error = match vaelo_channel
+        .call::<_, EchoResponse>(
+            &ECHO_METHOD,
+            EchoRequest { payload: OVERSIZED_RESPONSE_PAYLOAD.to_vec() }.into(),
+        )
+        .timeout(Duration::from_secs(3))
+        .await
+    {
+        Ok(_) => panic!("vaelo must reject a response over its decoding limit"),
+        Err(error) => error,
+    };
+    assert_eq!(error.remote_status().map(Status::code), Some(StatusCode::ResourceExhausted));
+    let response = vaelo_channel
+        .call::<_, EchoResponse>(
+            &ECHO_METHOD,
+            EchoRequest { payload: b"after oversized response".to_vec() }.into(),
+        )
+        .timeout(Duration::from_secs(2))
+        .await?;
+    assert_eq!(response.payload, b"after oversized response");
+    println!("message limits return ResourceExhausted without poisoning H2 connections: ok");
+    Ok(())
+}
+
+async fn check_deadlines_bidirectional(
+    tonic_address: SocketAddr,
+    tonic_deadlines_seen: &AtomicUsize,
+    vaelo_address: SocketAddr,
+    vaelo_deadlines_seen: &AtomicUsize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let before = tonic_deadlines_seen.load(Ordering::Relaxed);
+    let error = match grpc_channel(tonic_address)
+        .call::<_, EchoResponse>(
+            &ECHO_METHOD,
+            EchoRequest { payload: DEADLINE_PAYLOAD.to_vec() }.into(),
+        )
+        .timeout(Duration::from_millis(40))
+        .await
+    {
+        Ok(_) => panic!("vaelo deadline must expire"),
+        Err(error) => error,
+    };
+    assert!(
+        error.is_timeout()
+            || error.remote_status().is_some_and(|status| matches!(
+                status.code(),
+                StatusCode::Canceled | StatusCode::DeadlineExceeded
+            )),
+        "unexpected vaelo deadline error: {error:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while tonic_deadlines_seen.load(Ordering::Relaxed) == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tonic server must observe vaelo grpc-timeout metadata");
+
+    let before = vaelo_deadlines_seen.load(Ordering::Relaxed);
+    let channel = tonic_channel(vaelo_address).await?;
+    let mut request = TonicRequest::new(EchoRequest { payload: DEADLINE_PAYLOAD.to_vec() });
+    request.set_timeout(Duration::from_millis(40));
+    let error = EchoServiceClient::new(channel.clone())
+        .echo(request)
+        .await
+        .expect_err("vaelo server must enforce tonic deadline");
+    assert!(matches!(error.code(), TonicCode::Cancelled | TonicCode::DeadlineExceeded));
+    assert_eq!(vaelo_deadlines_seen.load(Ordering::Relaxed), before + 1);
+    let response = EchoServiceClient::new(channel)
+        .echo(EchoRequest { payload: b"after deadline".to_vec() })
+        .await?;
+    assert_eq!(response.into_inner().payload, b"after deadline");
+    println!("grpc-timeout and DeadlineExceeded interoperate both directions: ok");
+    Ok(())
+}
+
+async fn check_ascii_duplicate_metadata_bidirectional(
+    tonic_address: SocketAddr,
+    vaelo_address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = Request::new(EchoRequest { payload: ASCII_METADATA_PAYLOAD.to_vec() });
+    request.metadata_mut().append(ASCII_METADATA_KEY, b"first".to_vec())?;
+    request.metadata_mut().append(ASCII_METADATA_KEY, b"second".to_vec())?;
+    let response = grpc_channel(tonic_address)
+        .call::<_, EchoResponse>(&ECHO_METHOD, request)
+        .timeout(Duration::from_secs(2))
+        .await?;
+    assert_eq!(
+        response.metadata().get_all(ASCII_METADATA_KEY).collect::<Vec<_>>(),
+        [b"first-response".as_slice(), b"second-response".as_slice()]
+    );
+
+    let mut request = TonicRequest::new(EchoRequest { payload: ASCII_METADATA_PAYLOAD.to_vec() });
+    request.metadata_mut().append(ASCII_METADATA_KEY, "first".parse()?);
+    request.metadata_mut().append(ASCII_METADATA_KEY, "second".parse()?);
+    let response =
+        EchoServiceClient::new(tonic_channel(vaelo_address).await?).echo(request).await?;
+    let actual = response
+        .metadata()
+        .get_all(ASCII_METADATA_KEY)
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(actual, ["first-response", "second-response"]);
+    println!("duplicate ASCII metadata preserves values and order both directions: ok");
+    Ok(())
+}
+
+async fn check_tonic_client_reads_vaelo_success_trailers(
+    address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = EchoServiceClient::new(tonic_channel(address).await?)
+        .expand(EchoRequest { payload: SUCCESS_TRAILERS_PAYLOAD.to_vec() })
+        .await?;
+    let mut stream = response.into_inner();
+    while stream.message().await?.is_some() {}
+    let trailers = stream.trailers().await?.expect("successful stream trailers");
+    assert_eq!(
+        trailers.get(TRAILING_METADATA_KEY).expect("vaelo success trailer").to_str()?,
+        "vaelo-success-trailer"
+    );
+    println!("tonic client reads vaelo successful trailing metadata: ok");
+    Ok(())
+}
+
+async fn check_partial_stream_errors_bidirectional(
+    tonic_address: SocketAddr,
+    vaelo_address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let channel = grpc_channel(tonic_address);
+    let response = channel
+        .server_streaming::<_, EchoResponse>(
+            &EXPAND_METHOD,
+            EchoRequest { payload: PARTIAL_STREAM_ERROR_PAYLOAD.to_vec() }.into(),
+        )
+        .timeout(Duration::from_secs(2))
+        .await?;
+    let mut stream = response.into_inner();
+    assert_eq!(stream.message().await?.unwrap().payload, b"before-error");
+    let error = stream.message().await.expect_err("tonic stream must end with DataLoss");
+    let status = error.remote_status().expect("remote tonic stream status");
+    assert_eq!(status.code(), StatusCode::DataLoss);
+    assert_eq!(
+        status.metadata().get(TRAILING_METADATA_KEY),
+        Some(b"tonic-error-trailer".as_slice())
+    );
+
+    let tonic_channel = tonic_channel(vaelo_address).await?;
+    let response = EchoServiceClient::new(tonic_channel.clone())
+        .expand(EchoRequest { payload: PARTIAL_STREAM_ERROR_PAYLOAD.to_vec() })
+        .await?;
+    let mut stream = response.into_inner();
+    assert_eq!(stream.message().await?.unwrap().payload, b"before-error");
+    let error = stream.message().await.expect_err("vaelo stream must end with DataLoss");
+    assert_eq!(error.code(), TonicCode::DataLoss);
+    let response = EchoServiceClient::new(tonic_channel)
+        .echo(EchoRequest { payload: b"after partial stream errors".to_vec() })
+        .await?;
+    assert_eq!(response.into_inner().payload, b"after partial stream errors");
+    println!("partial stream success followed by non-OK trailers interoperates: ok");
+    Ok(())
+}
+
+async fn check_tonic_compression_is_rejected_without_poisoning_connection(
+    address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let channel = tonic_channel(address).await?;
+    let error = EchoServiceClient::new(channel.clone())
+        .send_compressed(CompressionEncoding::Gzip)
+        .echo(EchoRequest { payload: b"compressed request".to_vec() })
+        .await
+        .expect_err("vaelo does not currently support compressed gRPC messages");
+    assert_eq!(error.code(), TonicCode::Unimplemented);
+    let response = EchoServiceClient::new(channel)
+        .echo(EchoRequest { payload: b"after rejected compression".to_vec() })
+        .await?;
+    assert_eq!(response.into_inner().payload, b"after rejected compression");
+    println!("unsupported tonic compression is rejected without poisoning the connection: ok");
+    Ok(())
 }
 
 async fn check_vaelo_client_to_tonic_server(
@@ -1110,6 +1660,16 @@ fn expanded_payloads(payload: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn slow_stream_payloads() -> Vec<Vec<u8>> {
+    (0..64_u32)
+        .map(|index| {
+            let mut payload = vec![0; 32 * 1024];
+            payload[..4].copy_from_slice(&index.to_be_bytes());
+            payload
+        })
+        .collect()
+}
+
 fn numbered_requests(payload: &[u8]) -> Vec<EchoRequest> {
     expanded_payloads(payload).into_iter().map(|payload| EchoRequest { payload }).collect()
 }
@@ -1137,4 +1697,15 @@ fn grpc_channel(address: SocketAddr) -> RpcChannel {
         .connection_tag(ConnectionTag::new(NEXT_TAG.fetch_add(1, Ordering::Relaxed) as u64))
         .build()
         .expect("valid gRPC test channel")
+}
+
+async fn tonic_channel(
+    address: SocketAddr,
+) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+    Endpoint::from_shared(format!("http://{address}"))?
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(3))
+        .tcp_nodelay(true)
+        .connect()
+        .await
 }

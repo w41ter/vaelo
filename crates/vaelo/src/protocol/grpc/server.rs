@@ -171,25 +171,40 @@ pub(crate) async fn handle_grpc_request_headers(
             .poll(cx)
     });
     tokio::pin!(work);
-    let response = if let Some(deadline) = deadline {
+    let (response, observe_cancellation_while_sending) = if let Some(deadline) = deadline {
         tokio::select! {
-            response = &mut work => response?,
+            response = &mut work => match response {
+                Ok(response) => (response, true),
+                Err(status) => (ServerResponse::failed(status), true),
+            },
             _ = cancellation.cancelled() => return Ok(()),
             _ = tokio::time::sleep_until(deadline.into()) => {
                 cancellation.cancel();
-                ServerResponse::failed(Status::new(
-                    StatusCode::DeadlineExceeded,
-                    "request deadline exceeded",
-                ))
+                (
+                    ServerResponse::failed(Status::new(
+                        StatusCode::DeadlineExceeded,
+                        "request deadline exceeded",
+                    )),
+                    false,
+                )
             }
         }
     } else {
         tokio::select! {
-            response = &mut work => response?,
+            response = &mut work => match response {
+                Ok(response) => (response, true),
+                Err(status) => (ServerResponse::failed(status), true),
+            },
             _ = cancellation.cancelled() => return Ok(()),
         }
     };
-    send_response(&mut send, response).finish().await
+    if !observe_cancellation_while_sending {
+        return send_response(&mut send, response).finish().await;
+    }
+    tokio::select! {
+        result = send_response(&mut send, response).finish() => result,
+        _ = cancellation.cancelled() => Ok(()),
+    }
 }
 
 #[derive(vaelo_derive::StaticResource)]
