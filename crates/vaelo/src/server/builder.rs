@@ -61,6 +61,7 @@ pub struct ServerBuilder {
     services: ServiceRegistryBuilder,
     http_routes: HttpRegistryBuilder,
     http_options: HttpServerOptions,
+    grpc_options: crate::GrpcOptions,
     tcp_options: TcpOptions,
     builtins: Option<BuiltinServices>,
     observation: ObservationPolicy,
@@ -74,6 +75,7 @@ impl Default for ServerBuilder {
             services: ServiceRegistryBuilder::default(),
             http_routes: HttpRegistryBuilder::default(),
             http_options: HttpServerOptions::default(),
+            grpc_options: crate::GrpcOptions::default(),
             tcp_options: TcpOptions::default(),
             builtins: None,
             observation: ObservationPolicy::Disabled,
@@ -106,6 +108,12 @@ impl ServerBuilder {
 
     pub fn http_options(mut self, options: HttpServerOptions) -> Self {
         self.http_options = options;
+        self
+    }
+
+    /// Configures per-message limits for gRPC requests and responses.
+    pub fn grpc_options(mut self, options: crate::GrpcOptions) -> Self {
+        self.grpc_options = options;
         self
     }
 
@@ -199,7 +207,8 @@ impl ServerBuilder {
             services,
             RpcAcceptorOptions { allowed_protocols: allowed, ..RpcAcceptorOptions::default() },
         )
-        .with_http(self.http_routes.build(), self.http_options);
+        .with_http(self.http_routes.build(), self.http_options)
+        .with_grpc(self.grpc_options);
         if let Some(builtins) = self.builtins {
             acceptor = acceptor.with_builtin(builtins);
         }

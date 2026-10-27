@@ -24,7 +24,7 @@ use vaelo::__private::{
     MethodKind, Protocol, ProtocolSet, RegisterService, RpcAcceptor, Server,
     ServerStreamingProstMethod, ServiceRegistryBuilder, UnaryProstMethod,
 };
-use vaelo::{ConnectionTag, Request, Response, RpcChannel, Status, StatusCode};
+use vaelo::{ConnectionTag, GrpcOptions, Request, Response, RpcChannel, Status, StatusCode};
 
 const ERROR_PAYLOAD: &[u8] = b"interop-status-details";
 const ERROR_DETAILS: &[u8] = b"\0\xfftest-structured-error";
@@ -43,6 +43,7 @@ const DEADLINE_PAYLOAD: &[u8] = b"interop-deadline";
 const ASCII_METADATA_PAYLOAD: &[u8] = b"interop-ascii-metadata";
 const SUCCESS_TRAILERS_PAYLOAD: &[u8] = b"interop-success-trailers";
 const OVERSIZED_RESPONSE_PAYLOAD: &[u8] = b"interop-oversized-response";
+const OVERSIZED_STREAM_RESPONSE_PAYLOAD: &[u8] = b"interop-oversized-stream-response";
 const ASCII_METADATA_KEY: &str = "test-ascii-metadata";
 const TRAILING_METADATA_KEY: &str = "test-trailer";
 
@@ -307,10 +308,13 @@ fn start_tonic_server_with_listener(
     let service_cancellations_seen = cancellations_seen.clone();
     let task = tokio::spawn(async move {
         let result = TonicServer::builder()
-            .add_service(EchoServiceServer::new(TonicEchoService {
-                deadlines_seen: service_deadlines_seen,
-                cancellations_seen: service_cancellations_seen,
-            }))
+            .add_service(
+                EchoServiceServer::new(TonicEchoService {
+                    deadlines_seen: service_deadlines_seen,
+                    cancellations_seen: service_cancellations_seen,
+                })
+                .max_decoding_message_size(8 * 1024 * 1024),
+            )
             .serve_with_incoming(incoming)
             .await;
         if let Err(error) = result {
@@ -520,6 +524,12 @@ struct VaeloServerHandle {
 }
 
 async fn start_vaelo_server() -> Result<VaeloServerHandle, Box<dyn std::error::Error>> {
+    start_vaelo_server_with_options(GrpcOptions::default()).await
+}
+
+async fn start_vaelo_server_with_options(
+    grpc_options: GrpcOptions,
+) -> Result<VaeloServerHandle, Box<dyn std::error::Error>> {
     let seen_remotes = Arc::new(Mutex::new(HashSet::new()));
     let deadlines_seen = Arc::new(AtomicUsize::new(0));
     let cancellations_seen = Arc::new(AtomicUsize::new(0));
@@ -530,7 +540,9 @@ async fn start_vaelo_server() -> Result<VaeloServerHandle, Box<dyn std::error::E
             cancellations_seen: cancellations_seen.clone(),
         })
         .build();
-    let acceptor = RpcAcceptor::new(services).allow_protocols(ProtocolSet::only(Protocol::Http2));
+    let acceptor = RpcAcceptor::new(services)
+        .allow_protocols(ProtocolSet::only(Protocol::Http2))
+        .with_grpc(grpc_options);
     let mut server = Server::new();
     let listener = server.listen_tcp("127.0.0.1:0", acceptor).await?;
     let address = listener.local_addr();
@@ -589,6 +601,11 @@ impl VaeloEchoService {
                 .expect("valid binary metadata key");
             return Err(status);
         }
+        let payload = if payload == OVERSIZED_RESPONSE_PAYLOAD {
+            vec![b'x'; 4 * 1024 * 1024 + 1]
+        } else {
+            payload
+        };
         let mut response = Response::new(EchoResponse { payload });
         if response.get_ref().payload == METADATA_PAYLOAD {
             assert_eq!(request_metadata.get("request-context-bin"), Some(REQUEST_METADATA));
@@ -645,6 +662,12 @@ impl VaeloEchoService {
             return Ok(Response::new(Box::pin(tokio_stream::iter(vec![
                 Ok(EchoResponse { payload: b"before-error".to_vec() }),
                 Err(Status::new(StatusCode::DataLoss, "vaelo stream failed after one message")),
+            ]))));
+        }
+        if request.payload == OVERSIZED_STREAM_RESPONSE_PAYLOAD {
+            return Ok(Response::new(Box::pin(tokio_stream::iter(vec![
+                Ok(EchoResponse { payload: b"before-oversized-message".to_vec() }),
+                Ok(EchoResponse { payload: vec![b'x'; 4 * 1024 * 1024 + 1] }),
             ]))));
         }
         if request.payload == SLOW_STREAM_PAYLOAD {
@@ -969,6 +992,63 @@ async fn check_message_size_limits(
         .timeout(Duration::from_secs(2))
         .await?;
     assert_eq!(response.payload, b"after oversized response");
+
+    let channel = tonic_channel(vaelo_address).await?;
+    let error = EchoServiceClient::new(channel.clone())
+        .max_decoding_message_size(8 * 1024 * 1024)
+        .echo(EchoRequest { payload: OVERSIZED_RESPONSE_PAYLOAD.to_vec() })
+        .await
+        .expect_err("vaelo must report an oversized encoded response");
+    assert_eq!(error.code(), TonicCode::ResourceExhausted);
+    assert!(error.message().starts_with("gRPC response message size "));
+    assert!(error.message().ends_with(" exceeds encoding limit 4194304"));
+
+    let response = EchoServiceClient::new(channel.clone())
+        .max_decoding_message_size(8 * 1024 * 1024)
+        .expand(EchoRequest { payload: OVERSIZED_STREAM_RESPONSE_PAYLOAD.to_vec() })
+        .await?;
+    let mut stream = response.into_inner();
+    assert_eq!(stream.message().await?.unwrap().payload, b"before-oversized-message");
+    let error = stream
+        .message()
+        .await
+        .expect_err("vaelo must terminate an oversized streaming response with a status");
+    assert_eq!(error.code(), TonicCode::ResourceExhausted);
+    assert!(error.message().starts_with("gRPC response message size "));
+    assert!(error.message().ends_with(" exceeds encoding limit 4194304"));
+    let response = EchoServiceClient::new(channel)
+        .echo(EchoRequest { payload: b"after vaelo oversized responses".to_vec() })
+        .await?;
+    assert_eq!(response.into_inner().payload, b"after vaelo oversized responses");
+
+    let configured_limit = 8 * 1024 * 1024;
+    let configured_server = start_vaelo_server_with_options(
+        GrpcOptions::default()
+            .max_decoding_message_size(configured_limit)
+            .max_encoding_message_size(configured_limit),
+    )
+    .await?;
+    let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+    let response = EchoServiceClient::new(tonic_channel(configured_server.address).await?)
+        .max_encoding_message_size(configured_limit)
+        .max_decoding_message_size(configured_limit)
+        .echo(EchoRequest { payload: oversized.clone() })
+        .await?;
+    assert_eq!(response.into_inner().payload, oversized);
+    configured_server.server.shutdown();
+
+    let configured_channel = RpcChannel::grpc(tonic_address)
+        .grpc_options(
+            GrpcOptions::default()
+                .max_encoding_message_size(configured_limit)
+                .max_decoding_message_size(configured_limit),
+        )
+        .build()?;
+    let response = configured_channel
+        .call::<_, EchoResponse>(&ECHO_METHOD, EchoRequest { payload: oversized.clone() }.into())
+        .timeout(Duration::from_secs(3))
+        .await?;
+    assert_eq!(response.payload, oversized);
     println!("message limits return ResourceExhausted without poisoning H2 connections: ok");
     Ok(())
 }

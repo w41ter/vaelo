@@ -83,6 +83,7 @@ impl ServerSession {
                         recv,
                         headers,
                         end_stream,
+                        context.grpc_options,
                     )
                     .await
                     {

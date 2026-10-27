@@ -32,7 +32,7 @@ where
     }
     let payload = encode_request(&message, profile_sampled)?;
     options.profile_sampled = profile_sampled;
-    let config = crate::protocol::grpc::GrpcConfig::default();
+    let config = channel.options().grpc_options;
     let key = channel.connection_key_with_tag(endpoint, connection_tag);
     let short_connection = channel.options().connection_mode == ConnectionMode::Short;
     let alloc_start = profile::start_if(profile_sampled);
@@ -78,7 +78,7 @@ pub(crate) fn start_streaming_owned(
         short_connection,
         method,
         options,
-        crate::protocol::grpc::GrpcConfig::default(),
+        channel.options().grpc_options,
         context.clone(),
         initial_payload,
     )?;

@@ -12,11 +12,11 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::net::TcpStream;
 
-use super::GrpcConfig;
-use super::framing::{MessageStreamDecoder, encode_message};
+use super::framing::{MessageDirection, MessageStreamDecoder, encode_message};
 use super::metadata::{
     append_metadata, decode_grpc_message, decode_status_details, metadata_from_headers,
 };
+use super::{GrpcOptions, status_from_h2_reset};
 use crate::client::recycler::{ClientActivityGuard, ClientConnectionState};
 use crate::foundation::cow_hash_map::CowHashMap;
 use crate::protocol::http2::connection::{
@@ -112,6 +112,7 @@ pub(crate) struct GrpcClientSendStream {
     call: Resource<GrpcStreamingCall>,
     h2: Option<H2SendStream>,
     finished: bool,
+    max_encoding_message_size: usize,
 }
 
 pub(crate) struct GrpcClientRecvStream {
@@ -139,10 +140,11 @@ pub(crate) fn submit_unary(
     method: &'static MethodDescriptor,
     options: RequestOptions,
     payload: IoBuf,
-    config: GrpcConfig,
+    config: GrpcOptions,
     context: Resource<CallContext>,
 ) -> Result<(), Status> {
-    let payload = encode_message(payload, config.max_encoding_message_size)?;
+    let payload =
+        encode_message(payload, config.max_encoding_message_size, MessageDirection::Request)?;
     let headers = grpc_request_headers(key.remote, method, &options)?;
     let (connection, activity) = connection_for(key, short_connection)?;
     if let Some(activity) = activity {
@@ -156,7 +158,10 @@ pub(crate) fn submit_unary(
             state: UnsafeCell::new(GrpcExchangeState::Unary(GrpcUnaryState {
                 headers: Some(headers),
                 payload: Some(payload),
-                decoder: MessageStreamDecoder::new(config.max_decoding_message_size),
+                decoder: MessageStreamDecoder::new(
+                    config.max_decoding_message_size,
+                    MessageDirection::Response,
+                ),
                 response_headers_seen: false,
                 response: None,
                 grpc_status: None,
@@ -174,7 +179,7 @@ pub(crate) fn submit_streaming(
     short_connection: bool,
     method: &'static MethodDescriptor,
     options: RequestOptions,
-    config: GrpcConfig,
+    config: GrpcOptions,
     context: Resource<CallContext>,
     initial_payload: Option<IoBuf>,
 ) -> Result<(Option<GrpcClientSendStream>, GrpcClientRecvStream), Status> {
@@ -218,13 +223,17 @@ pub(crate) fn submit_streaming(
         call: call.clone(),
         h2: None,
         finished: false,
+        max_encoding_message_size: config.max_encoding_message_size,
     });
     Ok((
         sender,
         GrpcClientRecvStream {
             call,
             h2: None,
-            decoder: MessageStreamDecoder::new(config.max_decoding_message_size),
+            decoder: MessageStreamDecoder::new(
+                config.max_decoding_message_size,
+                MessageDirection::Response,
+            ),
             messages: VecDeque::new(),
             credits: Vec::new(),
             release_credits_when_empty: false,
@@ -986,6 +995,10 @@ impl GrpcStreamingCall {
 }
 
 impl GrpcClientSendStream {
+    pub(crate) fn max_encoding_message_size(&self) -> usize {
+        self.max_encoding_message_size
+    }
+
     fn poll_open(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Status>> {
         if self.h2.is_some() {
             return Poll::Ready(Ok(()));
@@ -1479,9 +1492,7 @@ fn recv_status(error: RecvStreamError) -> Status {
         RecvStreamError::ProtocolError => {
             Status::new(StatusCode::Internal, "invalid HTTP/2 response")
         }
-        RecvStreamError::Reset(code) => {
-            Status::new(StatusCode::Unavailable, format!("gRPC stream reset: {code}"))
-        }
+        RecvStreamError::Reset(code) => status_from_h2_reset(code),
         RecvStreamError::UnprocessedByPeer(code) => Status::new(
             StatusCode::Unavailable,
             format!("gRPC stream was not processed before GOAWAY: {code}"),
@@ -1506,7 +1517,7 @@ mod tests {
                 state: UnsafeCell::new(GrpcExchangeState::Unary(GrpcUnaryState {
                     headers: Some(HeaderBlock::new()),
                     payload: Some(IoBuf::new()),
-                    decoder: MessageStreamDecoder::new(1024),
+                    decoder: MessageStreamDecoder::new(1024, MessageDirection::Response),
                     response_headers_seen: false,
                     response: None,
                     grpc_status: None,

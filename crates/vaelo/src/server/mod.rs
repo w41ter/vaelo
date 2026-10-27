@@ -31,4 +31,5 @@ pub(crate) struct ServerSessionContext {
     pub http_registry: HttpRegistry,
     pub builtin_registry: HttpRegistry,
     pub http_options: HttpServerOptions,
+    pub grpc_options: crate::GrpcOptions,
 }

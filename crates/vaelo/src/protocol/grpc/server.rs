@@ -12,12 +12,12 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::GrpcConfig;
-use super::framing::{MessageStreamDecoder, encode_message};
+use super::framing::{MessageDirection, MessageStreamDecoder, encode_message};
 use super::metadata::{
     append_metadata, append_metadata_unchecked, encode_grpc_message, encode_status_details,
     metadata_from_headers, validate_metadata,
 };
+use super::{GrpcOptions, status_from_h2_reset};
 use crate::protocol::http2::connection::{
     FlowCredit, H2RecvStream, H2SendStream, ReceivedEvent, RecvStreamError,
 };
@@ -38,10 +38,10 @@ pub(crate) struct GrpcServerRecvStream {
 }
 
 impl GrpcServerRecvStream {
-    fn new(h2: H2RecvStream, terminal: bool) -> Self {
+    fn new(h2: H2RecvStream, terminal: bool, max_message_size: usize) -> Self {
         Self {
             h2,
-            decoder: MessageStreamDecoder::new(GrpcConfig::default().max_decoding_message_size),
+            decoder: MessageStreamDecoder::new(max_message_size, MessageDirection::Request),
             messages: VecDeque::new(),
             credits: Vec::new(),
             release_credits_when_empty: false,
@@ -126,9 +126,7 @@ impl GrpcServerRecvStream {
 
 fn server_recv_status(error: RecvStreamError) -> Status {
     match error {
-        RecvStreamError::Reset(code) => {
-            Status::new(StatusCode::Canceled, format!("HTTP/2 stream reset: {code}"))
-        }
+        RecvStreamError::Reset(code) => status_from_h2_reset(code),
         RecvStreamError::ResourceExhausted => {
             Status::new(StatusCode::ResourceExhausted, "HTTP/2 stream resources exhausted")
         }
@@ -143,12 +141,15 @@ pub(crate) async fn handle_grpc_request_headers(
     mut recv: H2RecvStream,
     headers: HeaderBlock,
     end_stream: bool,
+    config: GrpcOptions,
 ) -> Result<(), Status> {
     let (method, context) = match resolve_request(remote_addr, &services, &headers) {
         Ok(resolved) => resolved,
         Err(status) => {
             log::warn!("gRPC request rejected: remote={remote_addr}, status={status}");
-            send_response(&mut send, ServerResponse::failed(status.clone())).finish().await?;
+            send_response(&mut send, ServerResponse::failed(status.clone()), config)
+                .finish()
+                .await?;
             return Ok(());
         }
     };
@@ -160,7 +161,15 @@ pub(crate) async fn handle_grpc_request_headers(
     recv.set_cancellation(cancellation.clone());
     let mut execution = GrpcCallExecution::resource_pool()
         .acquire_with_init(|| {
-            GrpcCallExecution::new(services, method, descriptor.kind, context, recv, end_stream)
+            GrpcCallExecution::new(
+                services,
+                method,
+                descriptor.kind,
+                context,
+                recv,
+                end_stream,
+                config.max_decoding_message_size,
+            )
         })
         .map_err(|_| Status::new(StatusCode::ResourceExhausted, "gRPC call resources exhausted"))?;
     let work = std::future::poll_fn(move |cx| {
@@ -199,10 +208,10 @@ pub(crate) async fn handle_grpc_request_headers(
         }
     };
     if !observe_cancellation_while_sending {
-        return send_response(&mut send, response).finish().await;
+        return send_response(&mut send, response, config).finish().await;
     }
     tokio::select! {
-        result = send_response(&mut send, response).finish() => result,
+        result = send_response(&mut send, response, config).finish() => result,
         _ = cancellation.cancelled() => Ok(()),
     }
 }
@@ -234,8 +243,9 @@ impl GrpcCallExecution {
         context: ServerRequestContext,
         recv: H2RecvStream,
         end_stream: bool,
+        max_decoding_message_size: usize,
     ) -> Self {
-        let request_stream = GrpcServerRecvStream::new(recv, end_stream);
+        let request_stream = GrpcServerRecvStream::new(recv, end_stream, max_decoding_message_size);
         let state = match kind {
             MethodKind::Unary | MethodKind::ServerStreaming => {
                 GrpcCallExecutionState::UnaryFirst { context, recv: request_stream }
@@ -390,7 +400,11 @@ impl SendResponse<'_> {
     }
 }
 
-fn send_response<'a>(send: &'a mut H2SendStream, response: ServerResponse) -> SendResponse<'a> {
+fn send_response<'a>(
+    send: &'a mut H2SendStream,
+    response: ServerResponse,
+    config: GrpcOptions,
+) -> SendResponse<'a> {
     let ServerResponse { body, status, metadata, trailing_metadata, .. } = response;
     let mut headers = HeaderBlock::new();
     headers.pseudo.status = Some(200);
@@ -430,9 +444,13 @@ fn send_response<'a>(send: &'a mut H2SendStream, response: ServerResponse) -> Se
                         Ok(payload) => {
                             let payload = encode_message(
                                 payload,
-                                GrpcConfig::default().max_encoding_message_size,
-                            )?;
-                            send_data_wait(send, payload, false).await?;
+                                config.max_encoding_message_size,
+                                MessageDirection::Response,
+                            );
+                            match payload {
+                                Ok(payload) => send_data_wait(send, payload, false).await?,
+                                Err(status) => terminal_status = Some(status),
+                            }
                         }
                         Err(status) => terminal_status = Some(status),
                     }
@@ -446,7 +464,11 @@ fn send_response<'a>(send: &'a mut H2SendStream, response: ServerResponse) -> Se
 
     let encoded = match body {
         ServerResponseBody::Unary(payload) => {
-            match encode_message(payload, GrpcConfig::default().max_encoding_message_size) {
+            match encode_message(
+                payload,
+                config.max_encoding_message_size,
+                MessageDirection::Response,
+            ) {
                 Ok(payload) => {
                     let trailers = response_trailers(None, &trailing_metadata);
                     if send.can_send_complete(1, true) {
@@ -467,13 +489,24 @@ fn send_response<'a>(send: &'a mut H2SendStream, response: ServerResponse) -> Se
         }
         ServerResponseBody::Stream(messages) => messages
             .into_iter()
-            .map(|payload| encode_message(payload, GrpcConfig::default().max_encoding_message_size))
+            .map(|payload| {
+                encode_message(
+                    payload,
+                    config.max_encoding_message_size,
+                    MessageDirection::Response,
+                )
+            })
             .collect(),
         ServerResponseBody::Incremental(_) => unreachable!(),
     };
     let data = match encoded {
         Ok(data) => data,
-        Err(error) => return SendResponse::Ready(Err(error)),
+        Err(error) => {
+            append_response_trailers(&mut headers, Some(&error), &trailing_metadata);
+            return SendResponse::Ready(send.send_headers(headers, true).map_err(|_| {
+                Status::new(StatusCode::Unavailable, "failed to send gRPC trailers-only response")
+            }));
+        }
     };
 
     let trailers = response_trailers(status.as_ref(), &trailing_metadata);

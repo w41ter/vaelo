@@ -8,8 +8,24 @@ use crate::{IoBuf, IoBufBuilder, Status, StatusCode};
 
 pub(crate) const MESSAGE_PREFIX_LEN: usize = 5;
 
+#[derive(Clone, Copy)]
+pub(crate) enum MessageDirection {
+    Request,
+    Response,
+}
+
+impl MessageDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+}
+
 pub(crate) struct MessageStreamDecoder {
     max_message_size: usize,
+    direction: MessageDirection,
     prefix: [u8; MESSAGE_PREFIX_LEN],
     prefix_len: usize,
     expected_len: Option<usize>,
@@ -17,9 +33,10 @@ pub(crate) struct MessageStreamDecoder {
 }
 
 impl MessageStreamDecoder {
-    pub fn new(max_message_size: usize) -> Self {
+    pub fn new(max_message_size: usize, direction: MessageDirection) -> Self {
         Self {
             max_message_size,
+            direction,
             prefix: [0; MESSAGE_PREFIX_LEN],
             prefix_len: 0,
             expected_len: None,
@@ -66,7 +83,11 @@ impl MessageStreamDecoder {
                 if len > self.max_message_size {
                     return Err(Status::new(
                         StatusCode::ResourceExhausted,
-                        "gRPC message exceeds limit",
+                        format!(
+                            "gRPC {} message size {len} exceeds decoding limit {}",
+                            self.direction.as_str(),
+                            self.max_message_size,
+                        ),
                     ));
                 }
                 self.expected_len = Some(len);
@@ -91,7 +112,7 @@ impl MessageStreamDecoder {
         if end_stream && (self.prefix_len != 0 || self.expected_len.is_some()) {
             return Err(Status::new(
                 StatusCode::Internal,
-                "gRPC request ended before a complete message arrived",
+                format!("gRPC {} ended before a complete message arrived", self.direction.as_str(),),
             ));
         }
 
@@ -100,13 +121,25 @@ impl MessageStreamDecoder {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
 struct StreamDecodeProgress {
     messages: Vec<IoBuf>,
 }
 
-pub(crate) fn encode_message(mut payload: IoBuf, max_size: usize) -> Result<IoBuf, Status> {
+pub(crate) fn encode_message(
+    mut payload: IoBuf,
+    max_size: usize,
+    direction: MessageDirection,
+) -> Result<IoBuf, Status> {
     if payload.len() > max_size || payload.len() > u32::MAX as usize {
-        return Err(Status::new(StatusCode::ResourceExhausted, "gRPC message exceeds limit"));
+        return Err(Status::new(
+            StatusCode::ResourceExhausted,
+            format!(
+                "gRPC {} message size {} exceeds encoding limit {max_size}",
+                direction.as_str(),
+                payload.len(),
+            ),
+        ));
     }
     let mut builder = IoBufBuilder::new();
     builder.put_u8(0);
@@ -138,9 +171,9 @@ mod tests {
 
     #[test]
     fn stream_decoder_accepts_multiple_fragmented_messages() {
-        let mut decoder = MessageStreamDecoder::new(16);
-        let first = encode_message(iobuf(&[1, 2]), 16).unwrap();
-        let second = encode_message(iobuf(&[3, 4, 5]), 16).unwrap();
+        let mut decoder = MessageStreamDecoder::new(16, MessageDirection::Request);
+        let first = encode_message(iobuf(&[1, 2]), 16, MessageDirection::Request).unwrap();
+        let second = encode_message(iobuf(&[3, 4, 5]), 16, MessageDirection::Request).unwrap();
         let mut bytes = flatten(first);
         bytes.extend(flatten(second));
 
@@ -152,5 +185,19 @@ mod tests {
         let progress = decoder.push(iobuf(&bytes[8..]), true).unwrap();
         assert_eq!(progress.messages.len(), 1);
         assert_eq!(flatten(progress.messages.into_iter().next().unwrap()), [3, 4, 5]);
+    }
+
+    #[test]
+    fn size_errors_report_direction_actual_size_and_limit() {
+        let error = encode_message(iobuf(&[0; 17]), 16, MessageDirection::Response).unwrap_err();
+        assert_eq!(error.code(), StatusCode::ResourceExhausted);
+        assert_eq!(error.message(), "gRPC response message size 17 exceeds encoding limit 16");
+
+        let framed = encode_message(iobuf(&[0; 17]), 32, MessageDirection::Request).unwrap();
+        let error = MessageStreamDecoder::new(16, MessageDirection::Request)
+            .push(framed, true)
+            .unwrap_err();
+        assert_eq!(error.code(), StatusCode::ResourceExhausted);
+        assert_eq!(error.message(), "gRPC request message size 17 exceeds decoding limit 16");
     }
 }

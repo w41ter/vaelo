@@ -51,6 +51,7 @@ pub(crate) use foundation::resource_pool::{
     StaticResource, UninitResource,
 };
 pub use metadata::{InvalidMetadataKey, MetadataEntry, MetadataKey, MetadataMap, MetadataValue};
+pub use protocol::grpc::GrpcOptions;
 pub(crate) use protocol::{Decode, Encode};
 pub use server::{
     BoundServer, BuiltinExposure, BuiltinServices, BuiltinServicesBuilder, HealthCheck,

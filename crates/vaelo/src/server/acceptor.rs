@@ -75,6 +75,7 @@ pub struct RpcAcceptor {
     http_registry: super::HttpRegistry,
     builtin_registry: super::HttpRegistry,
     http_options: super::HttpServerOptions,
+    grpc_options: crate::GrpcOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +108,7 @@ impl RpcAcceptor {
             http_registry: super::HttpRegistry::default(),
             builtin_registry: super::HttpRegistry::default(),
             http_options: super::HttpServerOptions::default(),
+            grpc_options: crate::GrpcOptions::default(),
         }
     }
 
@@ -122,6 +124,12 @@ impl RpcAcceptor {
     ) -> Self {
         self.http_registry = registry;
         self.http_options = options;
+        self
+    }
+
+    /// Configures per-message limits for gRPC connections accepted here.
+    pub fn with_grpc(mut self, options: crate::GrpcOptions) -> Self {
+        self.grpc_options = options;
         self
     }
 
@@ -143,6 +151,7 @@ impl Acceptor for RpcAcceptor {
             self.http_registry.clone(),
             self.builtin_registry.clone(),
             self.http_options.clone(),
+            self.grpc_options,
         );
         Ok(())
     }
@@ -157,6 +166,7 @@ fn spawn_protocol_detection(
     http_registry: super::HttpRegistry,
     builtin_registry: super::HttpRegistry,
     http_options: super::HttpServerOptions,
+    grpc_options: crate::GrpcOptions,
 ) {
     tokio::spawn(async move {
         detect_protocol(
@@ -167,6 +177,7 @@ fn spawn_protocol_detection(
             http_registry,
             builtin_registry,
             http_options,
+            grpc_options,
         )
         .await;
     });
@@ -181,6 +192,7 @@ async fn detect_protocol(
     http_registry: super::HttpRegistry,
     builtin_registry: super::HttpRegistry,
     http_options: super::HttpServerOptions,
+    grpc_options: crate::GrpcOptions,
 ) {
     let mut input = IoBuf::new();
     loop {
@@ -205,6 +217,7 @@ async fn detect_protocol(
                         http_registry,
                         builtin_registry,
                         http_options,
+                        grpc_options,
                     },
                     input,
                 );

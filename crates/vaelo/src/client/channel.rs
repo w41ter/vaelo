@@ -15,7 +15,7 @@ use super::naming::{
 };
 use super::{BidiStreamingCall, ClientStreamingCall, Request, ServerStreamingCall, UnaryCall};
 use crate::transport::connection::ConnectionKey;
-use crate::{Decode, Encode, Error, MethodDescriptor, Protocol, Result, RpcProtocol};
+use crate::{Decode, Encode, Error, GrpcOptions, MethodDescriptor, Protocol, Result, RpcProtocol};
 
 /// Selects an independent local traffic class.
 ///
@@ -82,6 +82,7 @@ pub(crate) struct ChannelOptions {
     pub connection_tag: ConnectionTag,
     pub connect_timeout: Option<Duration>,
     pub observation: ObservationPolicy,
+    pub grpc_options: GrpcOptions,
 }
 
 impl Default for ChannelOptions {
@@ -92,6 +93,7 @@ impl Default for ChannelOptions {
             connection_tag: ConnectionTag::DEFAULT,
             connect_timeout: None,
             observation: ObservationPolicy::Disabled,
+            grpc_options: GrpcOptions::default(),
         }
     }
 }
@@ -178,6 +180,12 @@ impl RpcChannelBuilder {
 
     pub fn observation(mut self, policy: ObservationPolicy) -> Self {
         self.options.observation = policy;
+        self
+    }
+
+    /// Configures per-message limits for gRPC channels.
+    pub fn grpc_options(mut self, options: GrpcOptions) -> Self {
+        self.options.grpc_options = options;
         self
     }
 

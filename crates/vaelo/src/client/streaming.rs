@@ -13,7 +13,7 @@ use tokio_stream::Stream;
 use super::call::CallOptions;
 use super::{CallHandle, ConnectionTag, Request, Response};
 use crate::protocol::grpc::client::{GrpcClientRecvStream, GrpcClientSendStream};
-use crate::protocol::grpc::framing::encode_message;
+use crate::protocol::grpc::framing::{MessageDirection, encode_message};
 use crate::protocol::grpc::server::GrpcServerRecvStream;
 use crate::{
     CallStats, Decode, Encode, Error, IoBuf, IoBufBuilder, MetadataMap, MethodDescriptor,
@@ -228,7 +228,10 @@ impl<RequestMessage, ResponseMessage> ServerStreamingCall<RequestMessage, Respon
             ));
         }
         let (message, request) = erase_request(self.request);
-        let payload = match encode_request_message(&message) {
+        let payload = match encode_request_message(
+            &message,
+            self.channel.options().grpc_options.encoding_message_size_limit(),
+        ) {
             Ok(payload) => payload,
             Err(status) => return StreamingCallHandle::failed(status),
         };
@@ -421,7 +424,9 @@ impl<T> SendStream<T> {
         if let Some(status) = &self.failure {
             return Err(status.clone().into());
         }
-        let mut payload = Some(encode_request_message(&message)?);
+        let max_message_size =
+            self.inner.as_ref().expect("active sender has H2 state").max_encoding_message_size();
+        let mut payload = Some(encode_request_message(&message, max_message_size)?);
         std::future::poll_fn(|context| {
             self.inner
                 .as_mut()
@@ -600,11 +605,11 @@ fn erase_request<T>(request: Request<T>) -> (T, Request<()>) {
     (message, erased)
 }
 
-fn encode_request_message<T: Encode>(message: &T) -> Result<IoBuf, Status> {
+fn encode_request_message<T: Encode>(
+    message: &T,
+    max_message_size: usize,
+) -> Result<IoBuf, Status> {
     let mut builder = IoBufBuilder::new();
     message.encode_to(&mut builder)?;
-    encode_message(
-        builder.finish(),
-        crate::protocol::grpc::GrpcConfig::default().max_encoding_message_size,
-    )
+    encode_message(builder.finish(), max_message_size, MessageDirection::Request)
 }

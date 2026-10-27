@@ -24,6 +24,47 @@ pub(crate) enum ErrorCode {
     Http11Required = 0xd,
 }
 
+impl ErrorCode {
+    pub(crate) const fn from_u32(code: u32) -> Option<Self> {
+        match code {
+            0x0 => Some(Self::NoError),
+            0x1 => Some(Self::ProtocolError),
+            0x2 => Some(Self::InternalError),
+            0x3 => Some(Self::FlowControlError),
+            0x4 => Some(Self::SettingsTimeout),
+            0x5 => Some(Self::StreamClosed),
+            0x6 => Some(Self::FrameSizeError),
+            0x7 => Some(Self::RefusedStream),
+            0x8 => Some(Self::Cancel),
+            0x9 => Some(Self::CompressionError),
+            0xa => Some(Self::ConnectError),
+            0xb => Some(Self::EnhanceYourCalm),
+            0xc => Some(Self::InadequateSecurity),
+            0xd => Some(Self::Http11Required),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::NoError => "NO_ERROR",
+            Self::ProtocolError => "PROTOCOL_ERROR",
+            Self::InternalError => "INTERNAL_ERROR",
+            Self::FlowControlError => "FLOW_CONTROL_ERROR",
+            Self::SettingsTimeout => "SETTINGS_TIMEOUT",
+            Self::StreamClosed => "STREAM_CLOSED",
+            Self::FrameSizeError => "FRAME_SIZE_ERROR",
+            Self::RefusedStream => "REFUSED_STREAM",
+            Self::Cancel => "CANCEL",
+            Self::CompressionError => "COMPRESSION_ERROR",
+            Self::ConnectError => "CONNECT_ERROR",
+            Self::EnhanceYourCalm => "ENHANCE_YOUR_CALM",
+            Self::InadequateSecurity => "INADEQUATE_SECURITY",
+            Self::Http11Required => "HTTP_1_1_REQUIRED",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConnectionError {
     pub code: ErrorCode,

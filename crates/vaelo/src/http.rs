@@ -233,6 +233,7 @@ impl ClientBuilder {
                         connection_tag: self.connection_tag,
                         connect_timeout: self.connect_timeout,
                         observation: self.observation,
+                        grpc_options: crate::GrpcOptions::default(),
                     },
                 )
                 .map_err(map_runtime_error)?,
