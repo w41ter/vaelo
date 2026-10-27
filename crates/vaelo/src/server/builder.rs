@@ -382,7 +382,9 @@ mod tests {
         ClientStreamingProstMethod, RegisterService, ServerStreamingProstMethod,
         ServiceRegistryBuilder,
     };
-    use crate::{IoBufBuilder, MethodDescriptor, MethodKind, Request, Response, Status};
+    use crate::{
+        IoBufBuilder, MethodDescriptor, MethodKind, Request, Response, Status, StatusCode,
+    };
 
     static LARGE_GRPC_STREAM: MethodDescriptor = MethodDescriptor::new(
         "test.Streaming",
@@ -395,6 +397,27 @@ mod tests {
         "test.Streaming",
         "Upload",
         MethodKind::ClientStreaming,
+        Idempotency::NoSideEffects,
+    );
+
+    static IMMEDIATE_GRPC_STREAM_ERROR: MethodDescriptor = MethodDescriptor::new(
+        "test.Streaming",
+        "ImmediateError",
+        MethodKind::ServerStreaming,
+        Idempotency::NoSideEffects,
+    );
+
+    static OK_GRPC_TRAILERS_ONLY: MethodDescriptor = MethodDescriptor::new(
+        "test.Streaming",
+        "EmptyTrailersOnly",
+        MethodKind::ServerStreaming,
+        Idempotency::NoSideEffects,
+    );
+
+    static DEFERRED_GRPC_STREAM_ERROR: MethodDescriptor = MethodDescriptor::new(
+        "test.Streaming",
+        "DeferredError",
+        MethodKind::ServerStreaming,
         Idempotency::NoSideEffects,
     );
 
@@ -440,6 +463,47 @@ mod tests {
                             bytes += message?.data.len() as u64;
                         }
                         Ok(Response::new(CountMessage { bytes }))
+                    },
+                ),
+            );
+        }
+    }
+
+    struct StreamingStatusService;
+
+    impl RegisterService for StreamingStatusService {
+        fn register(self, registry: &mut ServiceRegistryBuilder) {
+            registry.register(
+                &IMMEDIATE_GRPC_STREAM_ERROR,
+                ServerStreamingProstMethod::new(
+                    Arc::new(()),
+                    |_service: Arc<()>, _request: Request<EmptyMessage>| async move {
+                        let mut status =
+                            Status::unknown("not root").with_details(b"root-2".to_vec());
+                        status.metadata_mut().insert("leader", "node-2".to_owned()).unwrap();
+                        Err::<Response<tokio_stream::Empty<Result<BlobMessage, Status>>>, _>(status)
+                    },
+                ),
+            );
+            registry.register(
+                &OK_GRPC_TRAILERS_ONLY,
+                ServerStreamingProstMethod::new(
+                    Arc::new(()),
+                    |_service: Arc<()>, _request: Request<EmptyMessage>| async move {
+                        Err::<Response<tokio_stream::Empty<Result<BlobMessage, Status>>>, _>(
+                            Status::new(StatusCode::Ok, ""),
+                        )
+                    },
+                ),
+            );
+            registry.register(
+                &DEFERRED_GRPC_STREAM_ERROR,
+                ServerStreamingProstMethod::new(
+                    Arc::new(()),
+                    |_service: Arc<()>, _request: Request<EmptyMessage>| async move {
+                        Ok(Response::new(tokio_stream::iter([Err::<BlobMessage, _>(
+                            Status::unknown("stream failed"),
+                        )])))
                     },
                 ),
             );
@@ -832,6 +896,64 @@ mod tests {
             bytes += message.unwrap().data.len();
         }
         assert_eq!(bytes, 128 * 32 * 1024);
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn grpc_streaming_distinguishes_trailers_only_from_deferred_errors() {
+        let server = ServerBuilder::new()
+            .rpc_protocols([RpcProtocol::Grpc])
+            .http_versions([])
+            .add_service(StreamingStatusService)
+            .bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr();
+        let handle = server.handle();
+        let serving = tokio::spawn(server.serve());
+        let channel = crate::RpcChannel::grpc(address).build().unwrap();
+
+        let immediate = channel
+            .server_streaming::<_, BlobMessage>(
+                &IMMEDIATE_GRPC_STREAM_ERROR,
+                Request::new(EmptyMessage {}),
+            )
+            .await;
+        let Err(error) = immediate else {
+            panic!("a handler failure must fail while establishing the response stream")
+        };
+        let status = error.remote_status().expect("remote status");
+        assert_eq!(status.code(), StatusCode::Unknown);
+        assert_eq!(status.message(), "not root");
+        assert_eq!(status.details(), b"root-2");
+        assert_eq!(status.metadata().get("leader"), Some(b"node-2".as_slice()));
+
+        let response = channel
+            .server_streaming::<_, BlobMessage>(
+                &OK_GRPC_TRAILERS_ONLY,
+                Request::new(EmptyMessage {}),
+            )
+            .await
+            .unwrap();
+        let mut empty = response.into_inner();
+        assert!(empty.next().await.is_none());
+        assert!(empty.trailers().is_some());
+
+        let response = channel
+            .server_streaming::<_, BlobMessage>(
+                &DEFERRED_GRPC_STREAM_ERROR,
+                Request::new(EmptyMessage {}),
+            )
+            .await
+            .unwrap();
+        let mut deferred = response.into_inner();
+        let Some(Err(error)) = deferred.next().await else {
+            panic!("an error produced by an established stream must remain a stream item")
+        };
+        assert_eq!(error.remote_status().expect("remote status").message(), "stream failed");
+        assert!(deferred.next().await.is_none());
 
         handle.shutdown();
         tokio::time::timeout(Duration::from_secs(2), serving).await.unwrap().unwrap().unwrap();

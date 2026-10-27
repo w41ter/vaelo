@@ -37,6 +37,7 @@ const EARLY_STREAM_RESPONSE_PAYLOAD: &[u8] = b"interop-early-stream-response";
 const LONG_STREAM_PAYLOAD: &[u8] = b"interop-long-stream";
 const SLOW_STREAM_PAYLOAD: &[u8] = b"interop-slow-stream";
 const STREAM_ERROR_PAYLOAD: &[u8] = b"interop-stream-error";
+const STREAM_ERROR_MESSAGE: &str = "stream rejected before body";
 const PARTIAL_STREAM_ERROR_PAYLOAD: &[u8] = b"interop-partial-stream-error";
 const DEADLINE_PAYLOAD: &[u8] = b"interop-deadline";
 const ASCII_METADATA_PAYLOAD: &[u8] = b"interop-ascii-metadata";
@@ -155,6 +156,7 @@ async fn run_checks() -> Result<(), Box<dyn std::error::Error>> {
     check_ascii_duplicate_metadata_bidirectional(tonic_server.address, vaelo_server.address)
         .await?;
     check_tonic_client_reads_vaelo_success_trailers(vaelo_server.address).await?;
+    check_immediate_stream_errors_bidirectional(tonic_server.address, vaelo_server.address).await?;
     check_partial_stream_errors_bidirectional(tonic_server.address, vaelo_server.address).await?;
     check_tonic_compression_is_rejected_without_poisoning_connection(vaelo_server.address).await?;
     check_late_headers_after_timeout_do_not_break_connection(tonic_server.address).await?;
@@ -418,6 +420,19 @@ impl EchoService for TonicEchoService {
         request: TonicRequest<EchoRequest>,
     ) -> Result<TonicResponse<Self::ExpandStream>, TonicStatus> {
         let payload = request.into_inner().payload;
+        if payload == STREAM_ERROR_PAYLOAD {
+            let mut metadata = TonicMetadataMap::new();
+            metadata.insert_bin(
+                "test-error-details-bin",
+                TonicMetadataValue::from_bytes(ERROR_DETAILS),
+            );
+            return Err(TonicStatus::with_details_and_metadata(
+                TonicCode::Unknown,
+                STREAM_ERROR_MESSAGE,
+                ERROR_DETAILS.into(),
+                metadata,
+            ));
+        }
         let cancellations_seen = self.cancellations_seen.clone();
         let (sender, receiver) = mpsc::channel(4);
         tokio::spawn(async move {
@@ -607,7 +622,13 @@ impl VaeloEchoService {
         Status,
     > {
         if request.get_ref().payload == STREAM_ERROR_PAYLOAD {
-            return Err(Status::unknown("stream rejected before body"));
+            let mut status =
+                Status::unknown(STREAM_ERROR_MESSAGE).with_details(ERROR_DETAILS.to_vec());
+            status
+                .metadata_mut()
+                .insert("test-error-details-bin", ERROR_DETAILS.to_vec())
+                .expect("valid binary metadata key");
+            return Err(status);
         }
         self.seen_remotes
             .lock()
@@ -1050,6 +1071,62 @@ async fn check_tonic_client_reads_vaelo_success_trailers(
         "vaelo-success-trailer"
     );
     println!("tonic client reads vaelo successful trailing metadata: ok");
+    Ok(())
+}
+
+async fn check_immediate_stream_errors_bidirectional(
+    tonic_address: SocketAddr,
+    vaelo_address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vaelo_channel = grpc_channel(tonic_address);
+    let result = vaelo_channel
+        .server_streaming::<_, EchoResponse>(
+            &EXPAND_METHOD,
+            EchoRequest { payload: STREAM_ERROR_PAYLOAD.to_vec() }.into(),
+        )
+        .timeout(Duration::from_secs(2))
+        .await;
+    let Err(error) = result else {
+        panic!("tonic handler failure must reject the vaelo streaming call before yielding a body")
+    };
+    let status = error.remote_status().expect("remote tonic stream status");
+    assert_eq!(status.code(), StatusCode::Unknown);
+    assert_eq!(status.message(), STREAM_ERROR_MESSAGE);
+    assert_eq!(status.details(), ERROR_DETAILS);
+    assert_eq!(status.metadata().get("test-error-details-bin"), Some(ERROR_DETAILS));
+
+    let response = vaelo_channel
+        .call::<_, EchoResponse>(
+            &ECHO_METHOD,
+            EchoRequest { payload: b"after tonic immediate stream error".to_vec() }.into(),
+        )
+        .await?;
+    assert_eq!(response.payload, b"after tonic immediate stream error");
+
+    let tonic_channel = tonic_channel(vaelo_address).await?;
+    let result = EchoServiceClient::new(tonic_channel.clone())
+        .expand(EchoRequest { payload: STREAM_ERROR_PAYLOAD.to_vec() })
+        .await;
+    let Err(error) = result else {
+        panic!("vaelo handler failure must reject the tonic streaming call before yielding a body")
+    };
+    assert_eq!(error.code(), TonicCode::Unknown);
+    assert_eq!(error.message(), STREAM_ERROR_MESSAGE);
+    assert_eq!(error.details(), ERROR_DETAILS);
+    assert_eq!(
+        error
+            .metadata()
+            .get_bin("test-error-details-bin")
+            .expect("binary stream status metadata")
+            .to_bytes()?,
+        ERROR_DETAILS,
+    );
+
+    let response = EchoServiceClient::new(tonic_channel)
+        .echo(EchoRequest { payload: b"after vaelo immediate stream error".to_vec() })
+        .await?;
+    assert_eq!(response.into_inner().payload, b"after vaelo immediate stream error");
+    println!("server-streaming handlers rejected before body interoperate both directions: ok");
     Ok(())
 }
 

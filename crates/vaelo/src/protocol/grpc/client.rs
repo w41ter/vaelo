@@ -1109,10 +1109,19 @@ impl GrpcClientRecvStream {
                 }
                 validate_grpc_content_type(&headers)?;
                 if end_stream {
-                    return Poll::Ready(Err(Status::new(
-                        StatusCode::Unknown,
-                        "gRPC response ended without grpc-status",
-                    )));
+                    let status = grpc_status_from_headers(&headers)?.ok_or_else(|| {
+                        Status::new(StatusCode::Unknown, "gRPC response ended without grpc-status")
+                    })?;
+                    self.response_headers_seen = true;
+                    self.trailers = Some(status.metadata().clone());
+                    self.terminal = true;
+                    self.credits.clear();
+                    if status.code() == StatusCode::Ok {
+                        self.call.complete_ok();
+                        return Poll::Ready(Ok(crate::MetadataMap::new()));
+                    }
+                    self.call.fail(status.clone());
+                    return Poll::Ready(Err(status));
                 }
                 self.response_headers_seen = true;
                 Poll::Ready(metadata_from_headers(&headers))

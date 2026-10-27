@@ -404,11 +404,22 @@ fn send_response<'a>(send: &'a mut H2SendStream, response: ServerResponse) -> Se
         status = Some(error);
     }
 
+    // When the service fails before producing a response body, preserve that
+    // distinction on the wire. A trailers-only response lets streaming
+    // clients observe the failure while awaiting the call handle instead of
+    // first publishing a stream which can only fail when it is polled.
+    if status.is_some() {
+        append_response_trailers(&mut headers, status.as_ref(), &trailing_metadata);
+        return SendResponse::Ready(send.send_headers(headers, true).map_err(|_| {
+            Status::new(StatusCode::Unavailable, "failed to send gRPC trailers-only response")
+        }));
+    }
+
     let body = match body {
         ServerResponseBody::Incremental(mut stream) => {
             return SendResponse::Pending(Box::pin(async move {
                 send_headers_wait(send, headers, false).await?;
-                let mut terminal_status = status;
+                let mut terminal_status = None;
                 while terminal_status.is_none() {
                     let Some(item) =
                         std::future::poll_fn(|context| stream.as_mut().poll_next(context)).await
@@ -433,38 +444,32 @@ fn send_response<'a>(send: &'a mut H2SendStream, response: ServerResponse) -> Se
         body => body,
     };
 
-    let encoded = if status.is_some() {
-        Ok(Vec::new())
-    } else {
-        match body {
-            ServerResponseBody::Unary(payload) => {
-                match encode_message(payload, GrpcConfig::default().max_encoding_message_size) {
-                    Ok(payload) => {
-                        let trailers = response_trailers(None, &trailing_metadata);
-                        if send.can_send_complete(1, true) {
-                            return SendResponse::Ready(
-                                send.send_complete_direct(headers, Some(payload), Some(trailers))
-                                    .map_err(|_| {
-                                        Status::new(
-                                            StatusCode::Unavailable,
-                                            "failed to send gRPC response",
-                                        )
-                                    }),
-                            );
-                        }
-                        Ok(vec![payload])
+    let encoded = match body {
+        ServerResponseBody::Unary(payload) => {
+            match encode_message(payload, GrpcConfig::default().max_encoding_message_size) {
+                Ok(payload) => {
+                    let trailers = response_trailers(None, &trailing_metadata);
+                    if send.can_send_complete(1, true) {
+                        return SendResponse::Ready(
+                            send.send_complete_direct(headers, Some(payload), Some(trailers))
+                                .map_err(|_| {
+                                    Status::new(
+                                        StatusCode::Unavailable,
+                                        "failed to send gRPC response",
+                                    )
+                                }),
+                        );
                     }
-                    Err(error) => Err(error),
+                    Ok(vec![payload])
                 }
+                Err(error) => Err(error),
             }
-            ServerResponseBody::Stream(messages) => messages
-                .into_iter()
-                .map(|payload| {
-                    encode_message(payload, GrpcConfig::default().max_encoding_message_size)
-                })
-                .collect(),
-            ServerResponseBody::Incremental(_) => unreachable!(),
         }
+        ServerResponseBody::Stream(messages) => messages
+            .into_iter()
+            .map(|payload| encode_message(payload, GrpcConfig::default().max_encoding_message_size))
+            .collect(),
+        ServerResponseBody::Incremental(_) => unreachable!(),
     };
     let data = match encoded {
         Ok(data) => data,
@@ -490,6 +495,15 @@ fn send_response<'a>(send: &'a mut H2SendStream, response: ServerResponse) -> Se
 
 fn response_trailers(status: Option<&Status>, metadata: &MetadataMap) -> HeaderBlock {
     let mut trailers = HeaderBlock::new();
+    append_response_trailers(&mut trailers, status, metadata);
+    trailers
+}
+
+fn append_response_trailers(
+    trailers: &mut HeaderBlock,
+    status: Option<&Status>,
+    metadata: &MetadataMap,
+) {
     let metadata_error = status
         .map(Status::metadata)
         .map(validate_metadata)
@@ -522,13 +536,12 @@ fn response_trailers(status: Option<&Status>, metadata: &MetadataMap) -> HeaderB
             });
         }
         if metadata_error.is_none() {
-            append_metadata_unchecked(&mut trailers, status.metadata());
+            append_metadata_unchecked(trailers, status.metadata());
         }
     }
     if metadata_error.is_none() {
-        append_metadata_unchecked(&mut trailers, metadata);
+        append_metadata_unchecked(trailers, metadata);
     }
-    trailers
 }
 
 async fn send_data_wait(
