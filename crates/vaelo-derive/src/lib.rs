@@ -15,16 +15,18 @@ pub fn derive_static_resource(input: TokenStream) -> TokenStream {
                     &POOL
                 }}
 
-                fn with_resource_local<R>(
+                fn try_with_resource_local<R>(
                     operation: impl FnOnce(&mut ::vaelo::ResourceLocal<Self>) -> R,
-                ) -> R {{
+                ) -> Option<R> {{
                     ::std::thread_local! {{
                         static LOCAL: ::std::cell::RefCell<::vaelo::ResourceLocal<{name}>> =
                             ::std::cell::RefCell::new(::vaelo::ResourceLocal::new(
                                 <{name} as ::vaelo::StaticResource>::resource_pool()
                             ));
                     }}
-                    LOCAL.with(|local| operation(&mut local.borrow_mut()))
+                    LOCAL
+                        .try_with(|local| operation(&mut local.borrow_mut()))
+                        .ok()
                 }}
             }}"
         )

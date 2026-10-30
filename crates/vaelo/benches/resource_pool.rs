@@ -43,12 +43,14 @@ impl StaticResource for BenchResource {
         &POOL
     }
 
-    fn with_resource_local<R>(operation: impl FnOnce(&mut ResourceLocal<Self>) -> R) -> R {
+    fn try_with_resource_local<R>(
+        operation: impl FnOnce(&mut ResourceLocal<Self>) -> R,
+    ) -> Option<R> {
         thread_local! {
             static LOCAL: RefCell<ResourceLocal<BenchResource>> =
                 RefCell::new(ResourceLocal::new(BenchResource::resource_pool()));
         }
-        LOCAL.with(|local| operation(&mut local.borrow_mut()))
+        LOCAL.try_with(|local| operation(&mut local.borrow_mut())).ok()
     }
 }
 
@@ -171,9 +173,10 @@ fn hot_path_components(c: &mut Criterion) {
     group.bench_function("resource_type_tls", |b| {
         b.iter(|| {
             for _ in 0..MILLION {
-                BenchResource::with_resource_local(|local| {
+                BenchResource::try_with_resource_local(|local| {
                     black_box(local as *mut ResourceLocal<BenchResource>);
-                });
+                })
+                .unwrap();
             }
         });
     });

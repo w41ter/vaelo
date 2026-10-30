@@ -110,8 +110,13 @@ pub enum ResourcePoolError {
 pub trait StaticResource: Sized + Send + Sync + 'static {
     fn resource_pool() -> &'static ResourcePool<Self>;
 
+    /// Returns `None` when the thread-local cache is being or has been
+    /// destroyed. Resource destruction can run during TLS teardown, so callers
+    /// must be able to fall back to the pool's global free list.
     #[doc(hidden)]
-    fn with_resource_local<R>(operation: impl FnOnce(&mut ResourceLocal<Self>) -> R) -> R;
+    fn try_with_resource_local<R>(
+        operation: impl FnOnce(&mut ResourceLocal<Self>) -> R,
+    ) -> Option<R>;
 }
 
 struct Slot<T> {
@@ -346,7 +351,7 @@ impl<T: StaticResource> ResourcePool<T> {
     }
 
     fn acquire_recycled(&self) -> Option<AcquiredSlot<T>> {
-        let index = self.with_local_cache(|local| {
+        let index = match self.try_with_local_cache(|local| {
             if let Some(index) = local.chunk.pop() {
                 return Some(index);
             }
@@ -356,7 +361,10 @@ impl<T: StaticResource> ResourcePool<T> {
             local.chunk_index = full_chunk_index;
             local.chunk = full_chunk;
             local.chunk.pop()
-        })?;
+        }) {
+            Some(index) => index?,
+            None => self.acquire_recycled_without_local()?,
+        };
 
         // This FreeChunk entry owns an active token, so the block cannot be
         // unlinked until this thread allocates the slot.
@@ -507,8 +515,26 @@ impl<T: StaticResource> ResourcePool<T> {
         (slot_index < unsafe { block.deref() }.len as usize).then_some((block, slot_index))
     }
 
-    fn with_local_cache<R>(&self, operation: impl FnOnce(&mut ResourceLocal<T>) -> R) -> R {
-        T::with_resource_local(operation)
+    fn try_with_local_cache<R>(
+        &self,
+        operation: impl FnOnce(&mut ResourceLocal<T>) -> R,
+    ) -> Option<R> {
+        T::try_with_resource_local(operation)
+    }
+
+    fn acquire_recycled_without_local(&self) -> Option<u32> {
+        // FreeList may contain partial chunks flushed by ResourceLocal::drop or
+        // recycle's TLS-teardown fallback. Return the remainder to the list so
+        // every free-slot token continues to have exactly one owner.
+        let chunk_index = self.free_list.pop()?;
+        let chunk = FREE_CHUNKS.get(chunk_index);
+        let index = chunk.pop().expect("FreeList contained an empty FreeChunk");
+        if chunk.is_empty() {
+            FREE_CHUNKS.release(chunk_index);
+        } else {
+            self.free_list.push(chunk_index);
+        }
+        Some(index)
     }
 
     fn assert_canonical(&'static self) {
@@ -519,15 +545,25 @@ impl<T: StaticResource> ResourcePool<T> {
     }
 
     fn recycle(&self, index: u32) {
-        self.with_local_cache(|local| {
-            local.chunk.push(index);
-            if local.chunk.is_full() {
-                local.list.push(local.chunk_index);
-                local.chunk_index = FREE_CHUNKS.acquire();
-                local.chunk = FREE_CHUNKS.get(local.chunk_index);
-                debug_assert!(local.chunk.is_empty());
-            }
-        });
+        if self
+            .try_with_local_cache(|local| {
+                local.chunk.push(index);
+                if local.chunk.is_full() {
+                    local.list.push(local.chunk_index);
+                    local.chunk_index = FREE_CHUNKS.acquire();
+                    local.chunk = FREE_CHUNKS.get(local.chunk_index);
+                    debug_assert!(local.chunk.is_empty());
+                }
+            })
+            .is_none()
+        {
+            // A Resource can be the payload of another TLS destructor. Do not
+            // lose its free-slot token merely because this resource type's TLS
+            // cache has already been destroyed.
+            let chunk_index = FREE_CHUNKS.acquire();
+            FREE_CHUNKS.get(chunk_index).push(index);
+            self.free_list.push(chunk_index);
+        }
     }
 }
 
@@ -865,7 +901,46 @@ const fn with_references(metadata: u64, references: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    struct TeardownResource;
+
+    static TEARDOWN_POOL: LazyLock<ResourcePool<TeardownResource>> =
+        LazyLock::new(|| ResourcePool::new(ResourcePoolConfig { max_items: 1 }));
+    static TEARDOWN_LOCAL_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+    thread_local! {
+        static TEARDOWN_LOCAL: RefCell<ResourceLocal<TeardownResource>> =
+            RefCell::new(ResourceLocal::new(&TEARDOWN_POOL));
+        static EXIT_RESOURCE: RefCell<ExitResource> = const { RefCell::new(ExitResource(None)) };
+    }
+
+    impl StaticResource for TeardownResource {
+        fn resource_pool() -> &'static ResourcePool<Self> {
+            &TEARDOWN_POOL
+        }
+
+        fn try_with_resource_local<R>(
+            operation: impl FnOnce(&mut ResourceLocal<Self>) -> R,
+        ) -> Option<R> {
+            if !TEARDOWN_LOCAL_AVAILABLE.load(Ordering::Acquire) {
+                return None;
+            }
+            TEARDOWN_LOCAL.try_with(|local| operation(&mut local.borrow_mut())).ok()
+        }
+    }
+
+    struct ExitResource(Option<Resource<TeardownResource>>);
+
+    impl Drop for ExitResource {
+        fn drop(&mut self) {
+            TEARDOWN_LOCAL_AVAILABLE.store(false, Ordering::Release);
+            drop(self.0.take());
+        }
+    }
 
     #[test]
     fn fixed_layouts_have_the_requested_sizes() {
@@ -883,5 +958,26 @@ mod tests {
         assert_eq!(references(metadata), MAX_REFERENCES);
         assert_eq!(state(metadata), STATE_ALLOCATED);
         assert_eq!(generation(metadata).wrapping_add(1), 0);
+    }
+
+    #[test]
+    fn thread_exit_recycles_without_an_available_local_cache() {
+        TEARDOWN_LOCAL_AVAILABLE.store(true, Ordering::Release);
+        let original = std::thread::spawn(|| {
+            let resource = TEARDOWN_POOL.acquire_with_init(|| TeardownResource).unwrap();
+            let id = resource.id();
+            EXIT_RESOURCE.with(|slot| slot.borrow_mut().0 = Some(resource));
+            id
+        })
+        .join()
+        .unwrap();
+
+        assert!(!TEARDOWN_LOCAL_AVAILABLE.load(Ordering::Acquire));
+        let recycled = TEARDOWN_POOL.acquire_with_init(|| TeardownResource).unwrap();
+        assert_eq!(recycled.id().index(), original.index());
+        assert_ne!(recycled.id().generation(), original.generation());
+
+        drop(recycled);
+        TEARDOWN_LOCAL_AVAILABLE.store(true, Ordering::Release);
     }
 }

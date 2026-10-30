@@ -183,8 +183,10 @@ mod tests {
             &POOL
         }
 
-        fn with_resource_local<R>(operation: impl FnOnce(&mut ResourceLocal<Self>) -> R) -> R {
-            LOCAL.with(|local| operation(&mut local.borrow_mut()))
+        fn try_with_resource_local<R>(
+            operation: impl FnOnce(&mut ResourceLocal<Self>) -> R,
+        ) -> Option<R> {
+            LOCAL.try_with(|local| operation(&mut local.borrow_mut())).ok()
         }
     }
 
